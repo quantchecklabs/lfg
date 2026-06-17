@@ -8,7 +8,7 @@
 # straight to a GitHub Release — no registry access needed in CI.
 #
 # Usage:
-#   scripts/release.sh                 # build dist/lfg-linux-x64.tar.gz only
+#   scripts/release.sh                 # build dist/lfg-bundle.tar.gz only
 #   scripts/release.sh v0.1.0          # build AND publish a GitHub release (gh)
 #   SKIP_INSTALL=1 scripts/release.sh  # reuse the current node_modules / web/dist
 #
@@ -21,7 +21,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-ASSET="lfg-linux-x64.tar.gz"
+ASSET="lfg-bundle.tar.gz"
 OUT_DIR="$ROOT/dist"
 REPO_SLUG="${LFG_REPO_SLUG:-BennyKok/lfg}"
 VERSION="${1:-}"
@@ -31,6 +31,16 @@ die() { printf '\033[1;31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
 
 command -v bun >/dev/null || die "bun not found on PATH."
 command -v tar >/dev/null || die "tar not found on PATH."
+
+sha256_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  else
+    die "sha256sum or shasum is required to write the checksum."
+  fi
+}
 
 if [ "${SKIP_INSTALL:-}" != "1" ]; then
   say "Installing dependencies (uses your configured registry)…"
@@ -45,7 +55,7 @@ fi
 [ -f web/dist/index.html ] || die "web/dist missing — run without SKIP_INSTALL."
 
 # Stage exactly what the runtime needs (mirrors .github/workflows/release.yml).
-STAGE="$(mktemp -d)"
+STAGE="$(mktemp -d "${TMPDIR:-/tmp}/lfg-release.XXXXXX")"
 trap 'rm -rf "$STAGE"' EXIT
 mkdir -p "$STAGE/lfg/web"
 say "Staging bundle…"
@@ -64,16 +74,15 @@ cp -r web/dist "$STAGE/lfg/web/dist"
 # opencode-ai, the ai-sdk-provider-* packages) — only the heavy binary packages
 # and dev-only deps are removed.
 PRUNE=(
-  # Anthropic Claude Code binary (glibc + musl)
-  "@anthropic-ai/claude-agent-sdk-linux-x64"
-  "@anthropic-ai/claude-agent-sdk-linux-x64-musl"
-  # OpenAI Codex binary
-  "@openai/codex-linux-x64"
-  # OpenCode binaries (all libc/CPU variants) + the .bin shim into them
-  "opencode-linux-x64"
-  "opencode-linux-x64-baseline"
-  "opencode-linux-x64-musl"
-  "opencode-linux-x64-baseline-musl"
+  # Anthropic Claude Code platform binaries
+  "@anthropic-ai/claude-agent-sdk-*"
+  # OpenAI Codex platform binaries
+  "@openai/codex-*"
+  # OpenCode platform binaries + the .bin shim into them
+  "opencode-linux-*"
+  "opencode-darwin-*"
+  "opencode-win32-*"
+  "opencode-freebsd-*"
   ".bin/opencode"
   # dev-only
   "typescript"
@@ -82,13 +91,15 @@ PRUNE=(
 )
 say "Pruning vendored agent binaries + dev-only packages…"
 for p in "${PRUNE[@]}"; do
-  rm -rf "$STAGE/lfg/node_modules/$p"
+  for match in "$STAGE/lfg/node_modules"/$p; do
+    [ -e "$match" ] && rm -rf "$match"
+  done
 done
 
 mkdir -p "$OUT_DIR"
 say "Packing $ASSET…"
 tar -C "$STAGE" -czf "$OUT_DIR/$ASSET" lfg
-( cd "$OUT_DIR" && sha256sum "$ASSET" > "$ASSET.sha256" )
+( cd "$OUT_DIR" && printf '%s  %s\n' "$(sha256_file "$ASSET")" "$ASSET" > "$ASSET.sha256" )
 
 SIZE="$(du -h "$OUT_DIR/$ASSET" | cut -f1)"
 say "Built $OUT_DIR/$ASSET ($SIZE)"

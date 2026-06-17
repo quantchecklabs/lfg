@@ -4,12 +4,13 @@ Run and manage your AI coding agents on your own VPS.
 
 **Website:** [lfg.apps.omg.dev](https://lfg.apps.omg.dev)
 
-`lfg` turns a plain Linux box into a control plane for **Claude Code** and
-**Codex** agents. It spawns each agent in a long-lived `tmux` session, gives you
-an installable web UI to start, watch, steer, and answer them from any device,
-and reaches your box privately over **Tailscale** — no public ports, no SaaS in
-the middle. A pluggable agent engine can also run scheduled "insight" agents
-(code review, model watch, …) that produce reports with actionable follow-ups.
+`lfg` turns a plain Linux box or macOS workstation into a control plane for
+**Claude Code** and **Codex** agents. It spawns each agent in a long-lived
+`tmux` session, gives you an installable web UI to start, watch, steer, and
+answer them from any device, and reaches your box privately over **Tailscale** —
+no public ports, no SaaS in the middle. A pluggable agent engine can also run
+scheduled "insight" agents (code review, model watch, …) that produce reports
+with actionable follow-ups.
 
 - **Your agents, your machine.** Subscription `claude` OAuth or an API key — the
   box runs the agents, you keep the data.
@@ -43,9 +44,9 @@ least `claude` yourself. Because the bundle ships no prebuilt binaries, its
 `node_modules` is pure JS — the tarball itself is arch/libc-independent; only
 Bun and the agent CLIs are platform-specific.
 
-## One-command VPS setup
+## One-command setup
 
-On a fresh Ubuntu/Debian VPS, as a normal sudo user (not root):
+On a fresh Ubuntu/Debian VPS or macOS workstation, as a normal user (not root):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/BennyKok/lfg/main/scripts/setup.sh | bash
@@ -62,10 +63,11 @@ TS_AUTHKEY=tskey-auth-xxxx \
 The script is idempotent and installs/does, in order: Bun, `git`, `tmux`, the
 Claude CLI; downloads the latest **prebuilt release bundle** (a self-contained
 tarball with `node_modules` and the web UI already vendored — no registry
-install needed); joins your tailnet; writes a `.env`; and runs the web UI as a
-**systemd user service** fronted by `tailscale serve` (HTTPS on your MagicDNS
-name, tailnet-only). When it finishes it prints the URL and the one-time
-`claude` login step.
+install needed); joins your tailnet when Tailscale is available; writes a
+`.env`; and runs the web UI as a background user service (**systemd** on Linux,
+**launchd** on macOS). When Tailscale is connected, setup also configures
+`tailscale serve` (HTTPS on your MagicDNS name, tailnet-only). When it finishes
+it prints the URL and the one-time `claude` login step.
 
 > Pin a version with `LFG_RELEASE=v0.1.0`, or build from source instead with
 > `LFG_INSTALL_MODE=source` (git clone + `bun install`).
@@ -84,7 +86,7 @@ Easiest — grab the prebuilt bundle (no `bun install`; vendored deps):
 
 ```bash
 mkdir -p ~/lfg && curl -fSL \
-  https://github.com/BennyKok/lfg/releases/latest/download/lfg-linux-x64.tar.gz \
+  https://github.com/BennyKok/lfg/releases/latest/download/lfg-bundle.tar.gz \
   | tar -xz --strip-components=1 -C ~/lfg
 cd ~/lfg && cp .env.example .env   # edit as needed
 bun run serve                      # → http://127.0.0.1:8766
@@ -166,18 +168,20 @@ session. It pulls in a heavier dependency, so it's off unless you configure
 ```bash
 lfg setup                                   # re-pulls the latest release + restarts
 lfg setup   # (in a git checkout) does git pull + bun install instead
-# or, for a dev checkout, manually:
+# or, for a Linux dev checkout, manually:
 git pull && bun install && systemctl --user restart lfg
+# macOS dev checkout:
+git pull && bun install && launchctl kickstart -k gui/$(id -u)/dev.omg.lfg
 ```
 
 Releases are built **locally** with [`scripts/release.sh`](scripts/release.sh) —
 the bundled provider lives on a private registry GitHub runners can't reach, so
-the maintainer builds the `lfg-linux-x64.tar.gz` bundle on a machine that can
+the maintainer builds the `lfg-bundle.tar.gz` bundle on a machine that can
 resolve it and uploads it via `gh`:
 
 ```bash
 scripts/release.sh v0.1.0     # build + publish a GitHub release
-scripts/release.sh            # build dist/lfg-linux-x64.tar.gz only
+scripts/release.sh            # build dist/lfg-bundle.tar.gz only
 ```
 
 The [`release` workflow](.github/workflows/release.yml) is the CI equivalent,

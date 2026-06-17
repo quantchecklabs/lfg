@@ -23,7 +23,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest # linux x64 — matches the typical VPS target
+    runs-on: ubuntu-latest
     env:
       # `secrets` is not allowed in step `if:` — surface them as env first.
       NPM_REGISTRY: ${{ secrets.NPM_REGISTRY }}
@@ -68,10 +68,10 @@ jobs:
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          # Stable asset name → /releases/latest/download/lfg-linux-x64.tar.gz
+          # Stable asset name → /releases/latest/download/lfg-bundle.tar.gz
           tag_name: ${{ inputs.tag || github.ref_name }}
           files: |
-            dist/lfg-linux-x64.tar.gz
-            dist/lfg-linux-x64.tar.gz.sha256
+            dist/lfg-bundle.tar.gz
+            dist/lfg-bundle.tar.gz.sha256
           fail_on_unmatched_files: true
           generate_release_notes: true
