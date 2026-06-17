@@ -8,20 +8,21 @@
 # straight to a GitHub Release - no registry access needed in CI.
 #
 # Usage:
-#   scripts/release.sh                 # build dist/lfg-bundle.tar.gz only
+#   scripts/release.sh                 # build dist/lfg-<os>-<arch>.tar.gz only
 #   scripts/release.sh v0.1.0          # build AND publish a GitHub release (gh)
 #   SKIP_INSTALL=1 scripts/release.sh  # reuse the current node_modules / web/dist
 #
 # Env:
-#   SKIP_INSTALL=1   skip `bun install` + web build (use the tree as-is)
-#   LFG_REPO_SLUG    GitHub owner/repo to publish to (default: BennyKok/lfg)
+#   SKIP_INSTALL=1        skip `bun install` + web build (use the tree as-is)
+#   LFG_REPO_SLUG         GitHub owner/repo to publish to (default: BennyKok/lfg)
+#   LFG_TARGET_PLATFORM   override target label, e.g. linux-x64 or darwin-arm64.
+#                         Must match this host unless LFG_ALLOW_CROSS_TARGET=1.
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-ASSET="lfg-bundle.tar.gz"
 OUT_DIR="$ROOT/dist"
 REPO_SLUG="${LFG_REPO_SLUG:-BennyKok/lfg}"
 VERSION="${1:-}"
@@ -32,6 +33,22 @@ die() { printf '\033[1;31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
 command -v bun >/dev/null || die "bun not found on PATH."
 command -v tar >/dev/null || die "tar not found on PATH."
 
+norm_os() {
+  case "$(uname -s)" in
+    Linux) printf 'linux' ;;
+    Darwin) printf 'darwin' ;;
+    *) die "Unsupported release OS: $(uname -s)" ;;
+  esac
+}
+
+norm_arch() {
+  case "$(uname -m)" in
+    x86_64|amd64) printf 'x64' ;;
+    arm64|aarch64) printf 'arm64' ;;
+    *) die "Unsupported release arch: $(uname -m)" ;;
+  esac
+}
+
 sha256_file() {
   if command -v sha256sum >/dev/null 2>&1; then
     sha256sum "$1" | awk '{print $1}'
@@ -41,6 +58,13 @@ sha256_file() {
     die "sha256sum or shasum is required to write the checksum."
   fi
 }
+
+HOST_PLATFORM="$(norm_os)-$(norm_arch)"
+TARGET_PLATFORM="${LFG_TARGET_PLATFORM:-$HOST_PLATFORM}"
+if [ "$TARGET_PLATFORM" != "$HOST_PLATFORM" ] && [ "${LFG_ALLOW_CROSS_TARGET:-0}" != "1" ]; then
+  die "Refusing to build $TARGET_PLATFORM on $HOST_PLATFORM. Vendored node_modules is platform-specific; build this asset on a $TARGET_PLATFORM host."
+fi
+ASSET="${LFG_RELEASE_ASSET:-lfg-$TARGET_PLATFORM.tar.gz}"
 
 if [ "${SKIP_INSTALL:-}" != "1" ]; then
   say "Installing dependencies (uses your configured registry)..."
@@ -89,6 +113,23 @@ PRUNE=(
   "bun-types"
   "@types"
 )
+case "$TARGET_PLATFORM" in
+  linux-*)
+    PRUNE+=(
+      "@img/*darwin*"
+      "@img/*win32*"
+      "@img/*freebsd*"
+      "fsevents"
+    )
+    ;;
+  darwin-*)
+    PRUNE+=(
+      "@img/*linux*"
+      "@img/*win32*"
+      "@img/*freebsd*"
+    )
+    ;;
+esac
 say "Pruning vendored agent binaries + dev-only packages..."
 for p in "${PRUNE[@]}"; do
   for match in "$STAGE/lfg/node_modules"/$p; do

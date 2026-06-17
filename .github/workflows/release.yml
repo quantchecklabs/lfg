@@ -68,10 +68,10 @@ jobs:
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          # Stable asset name → /releases/latest/download/lfg-bundle.tar.gz
+          # Platform asset name, e.g. /releases/latest/download/lfg-linux-x64.tar.gz
           tag_name: ${{ inputs.tag || github.ref_name }}
           files: |
-            dist/lfg-bundle.tar.gz
-            dist/lfg-bundle.tar.gz.sha256
+            dist/lfg-*.tar.gz
+            dist/lfg-*.tar.gz.sha256
           fail_on_unmatched_files: true
           generate_release_notes: true

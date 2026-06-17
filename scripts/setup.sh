@@ -111,6 +111,21 @@ mktemp_tgz() {
   mktemp "${TMPDIR:-/tmp}/lfg.XXXXXX"
 }
 
+platform_asset() {
+  local os arch
+  case "$OS_NAME" in
+    Linux) os="linux" ;;
+    Darwin) os="darwin" ;;
+    *) die "Unsupported OS: $OS_NAME" ;;
+  esac
+  case "$(uname -m)" in
+    x86_64|amd64) arch="x64" ;;
+    arm64|aarch64) arch="arm64" ;;
+    *) die "Unsupported CPU architecture: $(uname -m)" ;;
+  esac
+  printf 'lfg-%s-%s.tar.gz' "$os" "$arch"
+}
+
 tailscale_sudo() {
   if [ "$OS_NAME" = "Linux" ]; then
     sudo tailscale "$@"
@@ -223,7 +238,7 @@ else
     fi
   }
 
-  ASSET="${LFG_RELEASE_ASSET:-lfg-bundle.tar.gz}"
+  ASSET="${LFG_RELEASE_ASSET:-$(platform_asset)}"
   URL="$(release_url "$ASSET")"
   say "Downloading bundled release (${LFG_RELEASE}) from ${LFG_REPO_SLUG}..."
   TMP_TGZ="$(mktemp_tgz)"
@@ -231,14 +246,14 @@ else
     rm -f "$TMP_TGZ"
     if [ -n "${LFG_RELEASE_ASSET:-}" ]; then
       die "Could not download $URL - check the tag, or use LFG_INSTALL_MODE=source."
-    elif [ "$OS_NAME" = "Linux" ]; then
-      ASSET="lfg-linux-x64.tar.gz"
+    elif [ "${LFG_ALLOW_LEGACY_BUNDLE:-0}" = "1" ]; then
+      ASSET="lfg-bundle.tar.gz"
       URL="$(release_url "$ASSET")"
-      warn "Platform-neutral bundle not found; trying legacy asset $ASSET."
+      warn "Platform-specific bundle not found; trying legacy asset $ASSET."
       TMP_TGZ="$(mktemp_tgz)"
       curl -fSL "$URL" -o "$TMP_TGZ" || die "Could not download $URL - check the tag, or use LFG_INSTALL_MODE=source."
     else
-      die "Could not download $URL - no macOS-compatible bundle was found. Check the tag, or use LFG_INSTALL_MODE=source."
+      die "Could not download $URL. This release does not have an asset for this platform yet. Build/publish $(platform_asset), set LFG_RELEASE_ASSET explicitly, or use LFG_INSTALL_MODE=source."
     fi
   fi
   # Verify the checksum when the release ships one (best-effort).

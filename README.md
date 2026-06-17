@@ -88,11 +88,18 @@ Requires [Bun](https://bun.sh), `tmux`, `git`, and the
 [Claude CLI](https://docs.claude.com/en/docs/claude-code) (and optionally Codex)
 on `PATH`.
 
-Easiest — grab the prebuilt bundle (no `bun install`; vendored deps):
+Easiest — grab the prebuilt bundle for your platform (no `bun install`;
+vendored deps):
 
 ```bash
-mkdir -p ~/lfg && curl -fSL \
-  https://github.com/BennyKok/lfg/releases/latest/download/lfg-bundle.tar.gz \
+case "$(uname -s)-$(uname -m)" in
+  Linux-x86_64|Linux-amd64) ASSET=lfg-linux-x64.tar.gz ;;
+  Linux-arm64|Linux-aarch64) ASSET=lfg-linux-arm64.tar.gz ;;
+  Darwin-x86_64) ASSET=lfg-darwin-x64.tar.gz ;;
+  Darwin-arm64) ASSET=lfg-darwin-arm64.tar.gz ;;
+  *) echo "unsupported platform"; exit 1 ;;
+esac
+mkdir -p ~/lfg && curl -fSL "https://github.com/BennyKok/lfg/releases/latest/download/$ASSET" \
   | tar -xz --strip-components=1 -C ~/lfg
 cd ~/lfg && cp .env.example .env   # edit as needed
 bun run serve                      # → http://127.0.0.1:8766
@@ -182,12 +189,12 @@ git pull && bun install && launchctl kickstart -k gui/$(id -u)/dev.omg.lfg
 
 Releases are built **locally** with [`scripts/release.sh`](scripts/release.sh) —
 the bundled provider lives on a private registry GitHub runners can't reach, so
-the maintainer builds the `lfg-bundle.tar.gz` bundle on a machine that can
+the maintainer builds each platform bundle on a matching machine that can
 resolve it and uploads it via `gh`:
 
 ```bash
-scripts/release.sh v0.1.0     # build + publish a GitHub release
-scripts/release.sh            # build dist/lfg-bundle.tar.gz only
+scripts/release.sh v0.1.0     # build + publish lfg-<os>-<arch>.tar.gz
+scripts/release.sh            # build dist/lfg-<os>-<arch>.tar.gz only
 ```
 
 The [`release` workflow](.github/workflows/release.yml) is the CI equivalent,
