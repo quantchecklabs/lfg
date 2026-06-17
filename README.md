@@ -38,11 +38,12 @@ agent runtimes — lfg drives whatever it finds on `PATH`. The target box needs:
 | | `opencode` on `PATH` | `opencode` agent + `opencode auth login` (`LFG_OPENCODE_PATH`) |
 | | Tailscale | private tailnet ingress; not needed to run on loopback |
 
-`setup.sh` installs all of these for you (claude required; codex/opencode
-best-effort). With a manual bundle download, install Bun, tmux, git, and at
-least `claude` yourself. Because the bundle ships no prebuilt binaries, its
-`node_modules` is pure JS — the tarball itself is arch/libc-independent; only
-Bun and the agent CLIs are platform-specific.
+`setup.sh` verifies these requirements and does not install or upgrade agent
+CLIs by default, because those tools own user auth/config. On Linux it installs
+base system packages and Bun by default for fresh VPS use; on macOS it only
+reports missing system requirements unless you explicitly opt in. Because the
+bundle ships no prebuilt agent binaries, its `node_modules` is pure JS; only Bun
+and the agent CLIs are platform-specific.
 
 ## One-command setup
 
@@ -60,17 +61,22 @@ TS_AUTHKEY=tskey-auth-xxxx \
   curl -fsSL https://raw.githubusercontent.com/BennyKok/lfg/main/scripts/setup.sh | bash
 ```
 
-The script is idempotent and installs/does, in order: Bun, `git`, `tmux`, the
-Claude CLI; downloads the latest **prebuilt release bundle** (a self-contained
-tarball with `node_modules` and the web UI already vendored — no registry
-install needed); joins your tailnet when Tailscale is available; writes a
-`.env`; and runs the web UI as a background user service (**systemd** on Linux,
-**launchd** on macOS). When Tailscale is connected, setup also configures
-`tailscale serve` (HTTPS on your MagicDNS name, tailnet-only). When it finishes
-it prints the URL and the one-time `claude` login step.
+The script is idempotent and does, in order: checks/installable system
+requirements; downloads the latest **prebuilt release bundle** (a self-contained
+tarball with `node_modules` and the web UI already vendored, no registry install
+needed); joins your tailnet when Tailscale is available; writes a `.env`; and
+runs the web UI as a background user service (**systemd** on Linux, **launchd**
+on macOS). When Tailscale is connected, setup also configures `tailscale serve`
+(HTTPS on your MagicDNS name, tailnet-only). When it finishes it prints the URL
+and any missing agent CLI warnings.
 
 > Pin a version with `LFG_RELEASE=v0.1.0`, or build from source instead with
 > `LFG_INSTALL_MODE=source` (git clone + `bun install`).
+>
+> Opt-in installers are available when you explicitly want setup to mutate the
+> machine: `LFG_INSTALL_SYSTEM_DEPS=1`, `LFG_INSTALL_BUN=1`,
+> `LFG_INSTALL_CLAUDE=1`, `LFG_INSTALL_CODEX=1`, `LFG_INSTALL_OPENCODE=1`, and
+> `LFG_UPDATE_SHELL_RC=1`.
 >
 > Forking? Point setup at your own repo with `LFG_REPO_SLUG=you/lfg` (release
 > tarballs) and `LFG_REPO_URL=…` (source mode). Re-run setup any time with
@@ -94,9 +100,9 @@ bun run serve                      # → http://127.0.0.1:8766
 
 > The bundle is slim (~80 MB) because it does **not** vendor the agent runtimes —
 > lfg drives whatever `claude` / `codex` / `opencode` it finds on `PATH` (override
-> via `LFG_CLAUDE_PATH` / `LFG_CODEX_PATH` / `LFG_OPENCODE_PATH`). The one-command
-> `setup.sh` installs them for you; with the manual bundle, install the agent
-> CLIs you intend to use yourself (`claude` is the default agent).
+> via `LFG_CLAUDE_PATH` / `LFG_CODEX_PATH` / `LFG_OPENCODE_PATH`). Install the
+> agent CLIs you intend to use yourself (`claude` is the default agent), or opt in
+> to the setup-managed installers listed above.
 
 From source (note: lfg depends on an AI-SDK provider that isn't on the public
 npm registry, so `bun install` only resolves if you can reach that provider —

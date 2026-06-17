@@ -2,8 +2,9 @@
 #
 # lfg - one-command setup for a fresh VPS or macOS workstation.
 #
-# Provisions Bun, tmux, git, the Claude CLI, fetches lfg, optionally joins your
-# Tailscale tailnet, and runs the web UI as a background user service.
+# Provisions Bun, tmux, git, fetches lfg, optionally joins your Tailscale
+# tailnet, and runs the web UI as a background user service. Agent CLIs are
+# detected but not installed unless explicitly requested.
 #
 # Brand-new VPS (run as a normal sudo user, NOT root):
 #   curl -fsSL https://raw.githubusercontent.com/BennyKok/lfg/main/scripts/setup.sh | bash
@@ -36,6 +37,21 @@ SERVICE_LABEL="dev.omg.lfg"
 LFG_INSTALL_MODE="${LFG_INSTALL_MODE:-release}"
 # Which release to pull in release mode: "latest" or a tag like v0.1.0.
 LFG_RELEASE="${LFG_RELEASE:-latest}"
+# Non-destructive defaults:
+#   - macOS never installs/updates user tools unless opted in.
+#   - agent CLIs are never installed unless opted in; existing installs are used.
+if [ "$(uname -s)" = "Darwin" ]; then
+  LFG_INSTALL_SYSTEM_DEPS="${LFG_INSTALL_SYSTEM_DEPS:-0}"
+  LFG_INSTALL_BUN="${LFG_INSTALL_BUN:-0}"
+  LFG_UPDATE_SHELL_RC="${LFG_UPDATE_SHELL_RC:-0}"
+else
+  LFG_INSTALL_SYSTEM_DEPS="${LFG_INSTALL_SYSTEM_DEPS:-1}"
+  LFG_INSTALL_BUN="${LFG_INSTALL_BUN:-1}"
+  LFG_UPDATE_SHELL_RC="${LFG_UPDATE_SHELL_RC:-1}"
+fi
+LFG_INSTALL_CLAUDE="${LFG_INSTALL_CLAUDE:-0}"
+LFG_INSTALL_CODEX="${LFG_INSTALL_CODEX:-0}"
+LFG_INSTALL_OPENCODE="${LFG_INSTALL_OPENCODE:-0}"
 
 say()  { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[!]\033[0m %s\n' "$*" >&2; }
@@ -70,6 +86,7 @@ if [ -n "$SCRIPT_SRC" ] && [ -f "$SCRIPT_SRC" ]; then
 fi
 
 ensure_path_line() { # append a line to common interactive shell rc files once
+  [ "$LFG_UPDATE_SHELL_RC" = "1" ] || return 0
   local line="$1"
   local files=("$HOME/.bashrc")
   if [ "$OS_NAME" = "Darwin" ]; then
@@ -104,6 +121,7 @@ tailscale_sudo() {
 
 # ---- 1. base packages ----
 if [ "$OS_NAME" = "Linux" ]; then
+  [ "$LFG_INSTALL_SYSTEM_DEPS" = "1" ] || die "Missing or unchecked system deps. Re-run with LFG_INSTALL_SYSTEM_DEPS=1, or install git, tmux, curl, ca-certificates, and jq yourself."
   say "Installing base packages (git, tmux, curl, jq)..."
   sudo apt-get update -y -qq
   sudo apt-get install -y -qq git tmux curl ca-certificates jq
@@ -113,9 +131,13 @@ else
     command -v "$pkg" >/dev/null 2>&1 || MISSING_PKGS+=("$pkg")
   done
   if [ "${#MISSING_PKGS[@]}" -gt 0 ]; then
-    command -v brew >/dev/null 2>&1 || die "Homebrew is required to install missing packages on macOS: ${MISSING_PKGS[*]}"
-    say "Installing base packages with Homebrew (${MISSING_PKGS[*]})..."
-    brew install "${MISSING_PKGS[@]}"
+    if [ "$LFG_INSTALL_SYSTEM_DEPS" = "1" ]; then
+      command -v brew >/dev/null 2>&1 || die "Homebrew is required to install missing packages on macOS: ${MISSING_PKGS[*]}"
+      say "Installing base packages with Homebrew (${MISSING_PKGS[*]})..."
+      brew install "${MISSING_PKGS[@]}"
+    else
+      die "Missing required commands on macOS: ${MISSING_PKGS[*]}. Install them yourself, or re-run with LFG_INSTALL_SYSTEM_DEPS=1 to let setup use Homebrew."
+    fi
   else
     say "Base packages already installed."
   fi
@@ -123,33 +145,51 @@ fi
 
 # ---- 2. Bun ----
 if ! command -v bun >/dev/null 2>&1; then
-  say "Installing Bun..."
-  curl -fsSL https://bun.sh/install | bash
+  if [ "$LFG_INSTALL_BUN" = "1" ]; then
+    say "Installing Bun..."
+    curl -fsSL https://bun.sh/install | bash
+  else
+    die "Bun is required but was not found on PATH. Install Bun yourself, or re-run with LFG_INSTALL_BUN=1 to let setup run the Bun installer."
+  fi
 fi
 export PATH="$HOME/.bun/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 ensure_path_line 'export PATH="$HOME/.bun/bin:$PATH"'
-command -v bun >/dev/null || die "Bun install did not land on PATH."
+BUN_BIN="$(command -v bun || true)"
+[ -n "$BUN_BIN" ] || die "Bun is required but was not found on PATH."
+BUN_BIN="$(cd "$(dirname "$BUN_BIN")" && pwd)/$(basename "$BUN_BIN")"
 
 # ---- 3. agent CLIs (claude / codex / opencode) ----
 # The release bundle ships NO vendored agent binaries - lfg drives whatever
 # `claude` / `codex` / `opencode` it finds on PATH (override via LFG_*_PATH).
-# Claude is required (default agent); codex + opencode are optional/best-effort.
+# Never install or upgrade these by default: they own user auth/config.
 if ! command -v claude >/dev/null 2>&1; then
-  say "Installing the Claude CLI..."
-  curl -fsSL https://claude.ai/install.sh | bash
+  if [ "$LFG_INSTALL_CLAUDE" = "1" ]; then
+    say "Installing the Claude CLI..."
+    curl -fsSL https://claude.ai/install.sh | bash
+  else
+    warn "Claude CLI not found. lfg will start, but Claude sessions will be unavailable until you install/authenticate claude. Re-run with LFG_INSTALL_CLAUDE=1 only if you want setup to run Anthropic's installer."
+  fi
 fi
 export PATH="$HOME/.local/bin:$PATH"
 ensure_path_line 'export PATH="$HOME/.local/bin:$PATH"'
 
-# Optional runtimes - install globally via bun (lands in ~/.bun/bin, already on
-# PATH). Best-effort: a failure just means that agent kind is unavailable.
-if [ "${LFG_INSTALL_CODEX:-1}" = "1" ] && ! command -v codex >/dev/null 2>&1; then
-  say "Installing the Codex CLI (optional)..."
-  bun add -g @openai/codex >/dev/null 2>&1 || warn "codex install failed - the 'codex' agent kind will be unavailable."
+# Optional runtimes. Best-effort: a missing binary just means that agent kind is
+# unavailable. Installing is explicit because these CLIs own user auth/config.
+if ! command -v codex >/dev/null 2>&1; then
+  if [ "$LFG_INSTALL_CODEX" = "1" ]; then
+    say "Installing the Codex CLI (optional)..."
+    "$BUN_BIN" add -g @openai/codex >/dev/null 2>&1 || warn "codex install failed - the 'codex' agent kind will be unavailable."
+  else
+    warn "Codex CLI not found. Codex sessions will be unavailable until you install/authenticate codex. Re-run with LFG_INSTALL_CODEX=1 only if you want setup to install it with Bun."
+  fi
 fi
-if [ "${LFG_INSTALL_OPENCODE:-1}" = "1" ] && ! command -v opencode >/dev/null 2>&1; then
-  say "Installing OpenCode (optional)..."
-  bun add -g opencode-ai >/dev/null 2>&1 || warn "opencode install failed - the 'opencode' agent kind will be unavailable."
+if ! command -v opencode >/dev/null 2>&1; then
+  if [ "$LFG_INSTALL_OPENCODE" = "1" ]; then
+    say "Installing OpenCode (optional)..."
+    "$BUN_BIN" add -g opencode-ai >/dev/null 2>&1 || warn "opencode install failed - the 'opencode' agent kind will be unavailable."
+  else
+    warn "OpenCode CLI not found. OpenCode sessions will be unavailable until you install/authenticate opencode. Re-run with LFG_INSTALL_OPENCODE=1 only if you want setup to install it with Bun."
+  fi
 fi
 
 # ---- 4. fetch lfg (bundled release tarball, or git clone for dev) ----
@@ -169,7 +209,7 @@ if [ "$LFG_INSTALL_MODE" = "source" ]; then
   fi
   # The web UI ships prebuilt in web/dist, so no web build is needed here.
   say "Installing dependencies..."
-  ( cd "$LFG_DIR" && bun install )
+  ( cd "$LFG_DIR" && "$BUN_BIN" install )
 else
   # Release mode: download the self-contained tarball (vendored node_modules,
   # incl. the private "vibes" AI-SDK provider that isn't on the public registry)
@@ -273,10 +313,10 @@ Type=simple
 WorkingDirectory=$LFG_DIR
 EnvironmentFile=$LFG_DIR/.env
 # claude/codex must resolve when spawned into tmux panes (see src/tmux.ts).
-Environment=PATH=$HOME/.local/bin:$HOME/.bun/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PATH=$HOME/.local/bin:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin
 # Hard-bind to loopback so a stale .env can never expose the UI publicly.
 Environment=LFG_HOST=127.0.0.1
-ExecStart=$HOME/.bun/bin/bun run $LFG_DIR/src/cli.ts serve
+ExecStart=$BUN_BIN run $LFG_DIR/src/cli.ts serve
 Restart=on-failure
 RestartSec=3
 # The tmux server that holds every Claude session is spawned by serve, so it
@@ -311,7 +351,7 @@ install_macos_service() {
   PLIST="$UNIT_DIR/$SERVICE_LABEL.plist"
   mkdir -p "$UNIT_DIR" "$LOG_DIR"
 
-  START_CMD="cd \"$LFG_DIR\" && set -a && [ -f \"$LFG_DIR/.env\" ] && . \"$LFG_DIR/.env\"; set +a; export PATH=\"$HOME/.local/bin:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin\" LFG_HOST=127.0.0.1; exec \"$HOME/.bun/bin/bun\" run \"$LFG_DIR/src/cli.ts\" serve"
+  START_CMD="cd \"$LFG_DIR\" && set -a && [ -f \"$LFG_DIR/.env\" ] && . \"$LFG_DIR/.env\"; set +a; export PATH=\"$HOME/.local/bin:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin\" LFG_HOST=127.0.0.1; exec \"$BUN_BIN\" run \"$LFG_DIR/src/cli.ts\" serve"
   XML_START_CMD="$(printf '%s' "$START_CMD" | xml_escape)"
   XML_LFG_DIR="$(printf '%s' "$LFG_DIR" | xml_escape)"
   XML_LOG_DIR="$(printf '%s' "$LOG_DIR" | xml_escape)"

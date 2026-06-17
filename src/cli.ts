@@ -1,9 +1,4 @@
 #!/usr/bin/env bun
-import { cmdServe } from "./commands/serve.ts";
-import { cmdAgents } from "./commands/agents.ts";
-import { cmdWhatsapp } from "./commands/whatsapp.ts";
-import { cmdSetup } from "./commands/setup.ts";
-
 const HELP = `lfg — run and manage your AI coding agents on your own box
 
 Usage:
@@ -19,14 +14,22 @@ Env (read from process env / .env, see .env.example):
 async function main() {
   const [cmd, ...rest] = process.argv.slice(2);
   switch (cmd) {
-    case "serve":
+    case "serve": {
+      const { cmdServe } = await import("./commands/serve.ts");
       return await cmdServe();
-    case "agents":
+    }
+    case "agents": {
+      const { cmdAgents } = await import("./commands/agents.ts");
       return await cmdAgents(rest);
-    case "whatsapp":
+    }
+    case "whatsapp": {
+      const { cmdWhatsapp } = await import("./commands/whatsapp.ts");
       return await cmdWhatsapp(rest);
-    case "setup":
+    }
+    case "setup": {
+      const { cmdSetup } = await import("./commands/setup.ts");
       return await cmdSetup(rest);
+    }
     case undefined:
     case "help":
     case "-h":
