@@ -217,6 +217,41 @@ export async function updateFinding(
   return found;
 }
 
+// ---------- finding actions (instrumentation) ----------
+// Which CTA a user actually taps on a finding, and whether they had typed an
+// instruction first. The FindingSheet stacks several affordances (composer
+// send, one-tap "Make the change", dismiss); without this we have no data on
+// which one earns its place. Append-only JSONL, fire-and-forget — never blocks
+// the user action.
+
+export type FindingActionPath = "reply" | "execute" | "dismiss";
+
+export type FindingActionEvent = {
+  findingId: string;
+  path: FindingActionPath;
+  hadText: boolean;
+  at: number;
+};
+
+const findingActionsPath = () => join(dir(), "finding-actions.jsonl");
+
+export async function logFindingAction(input: {
+  findingId: string;
+  path: FindingActionPath;
+  hadText: boolean;
+}): Promise<void> {
+  await ensure();
+  const ev: FindingActionEvent = {
+    findingId: input.findingId,
+    path: input.path,
+    hadText: input.hadText,
+    at: Date.now(),
+  };
+  const f = Bun.file(findingActionsPath());
+  const prev = (await f.exists()) ? await f.text() : "";
+  await Bun.write(findingActionsPath(), prev + JSON.stringify(ev) + "\n");
+}
+
 // Dedup: a finding with the same normalized title for this agent that is still
 // open (or was dismissed) should not be re-added. Keeps the stream from
 // re-accumulating the same item every run.

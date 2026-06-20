@@ -258,6 +258,22 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
   return data as T;
 }
 
+// Fire-and-forget instrumentation: record which CTA a finding graduated
+// through (composer send vs one-tap "Make the change" vs dismiss) and whether
+// the user had typed an instruction first. Never block or surface errors — a
+// dropped telemetry beat must not interfere with the user's action.
+function logFindingAction(
+  findingId: string,
+  path: "reply" | "execute" | "dismiss",
+  hadText: boolean,
+): void {
+  void fetch(`/api/auto/findings/${findingId}/action`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path, hadText }),
+  }).catch(() => {});
+}
+
 function timeAgo(value?: number | null) {
   if (!value) return "unknown";
   const seconds = Math.max(0, Math.round((Date.now() - value) / 1000));
@@ -4713,6 +4729,7 @@ function FindingSheet({
     const t = text.trim();
     if (!t || busy) return;
     setBusy(true);
+    logFindingAction(finding.id, "reply", true);
     try {
       await onReply(finding, t);
     } finally {
@@ -4721,11 +4738,13 @@ function FindingSheet({
   }
 
   // One-tap path: graduate the finding into a session that immediately acts on
-  // the agent's suggested fix, with no typing required. Any text the user has
-  // started typing still takes precedence as the instruction.
+  // the agent's suggested fix, with no typing required. Only offered in the
+  // empty state — once the user types, the composer send IS this action (same
+  // onReply call), so we collapse to the single ArrowUp affordance.
   async function execute() {
     if (busy) return;
     setBusy(true);
+    logFindingAction(finding.id, "execute", !!text.trim());
     try {
       await onReply(finding, text.trim() || "Go ahead and implement this fix now.");
     } finally {
@@ -4786,18 +4805,26 @@ function FindingSheet({
             {busy ? <Loader2 className="size-4 animate-spin" /> : <ArrowUp className="size-4" />}
           </Button>
         </div>
-        <Button
-          variant="brand"
-          disabled={busy}
-          onClick={() => void execute()}
-          className="mt-3 w-full"
-        >
-          {busy ? <Loader2 className="size-4 animate-spin" /> : <Check className="size-4" />}
-          Make the change
-        </Button>
+        {/* The one-tap default only earns its space in the empty state. Once
+            the user types, the composer ArrowUp runs the exact same onReply, so
+            a second full-width brand button would just be a duplicate CTA. */}
+        {text.trim() ? null : (
+          <Button
+            variant="brand"
+            disabled={busy}
+            onClick={() => void execute()}
+            className="mt-3 w-full"
+          >
+            {busy ? <Loader2 className="size-4 animate-spin" /> : <Check className="size-4" />}
+            Make the change
+          </Button>
+        )}
         <button
           type="button"
-          onClick={() => onDismiss(finding)}
+          onClick={() => {
+            logFindingAction(finding.id, "dismiss", !!text.trim());
+            onDismiss(finding);
+          }}
           disabled={busy}
           className="mt-3 w-full rounded-xl border border-border py-2.5 text-[13px] font-medium text-muted-foreground disabled:opacity-50"
         >

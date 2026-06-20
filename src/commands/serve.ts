@@ -27,6 +27,8 @@ import {
   isRunning,
   listFindings,
   updateFinding,
+  logFindingAction,
+  type FindingActionPath,
 } from "../auto/store.ts";
 import { runAutoAgent } from "../auto/runner.ts";
 import { startAutoScheduler } from "../auto/scheduler.ts";
@@ -863,6 +865,26 @@ export async function cmdServe() {
           const f = await updateFinding(m[1], patch);
           if (!f) return err(404, "unknown finding");
           return json({ finding: f });
+        }
+      }
+
+      // Instrumentation: which CTA the user tapped on a finding, and whether
+      // they had typed an instruction first. Fire-and-forget from the client.
+      {
+        const m = path.match(/^\/api\/auto\/findings\/([0-9a-f]+)\/action$/);
+        if (m && req.method === "POST") {
+          const b = (await req.json().catch(() => null)) as {
+            path?: FindingActionPath;
+            hadText?: boolean;
+          } | null;
+          if (b?.path !== "reply" && b?.path !== "execute" && b?.path !== "dismiss")
+            return err(400, "expected { path: reply|execute|dismiss }");
+          await logFindingAction({
+            findingId: m[1],
+            path: b.path,
+            hadText: !!b.hadText,
+          });
+          return json({ ok: true });
         }
       }
 
