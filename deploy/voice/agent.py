@@ -39,73 +39,98 @@ from livekit.agents import (
 LFG = os.environ.get("LFG_BASE", "http://127.0.0.1:8766")
 CREDS_FILE = Path.home() / ".claude" / ".credentials.json"
 ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
-# The voice brain is Haiku (fast, cheap). When it isn't confident it escalates
-# up the ladder — Sonnet, then Opus — and each stronger model gets the SAME
-# fleet tools, so it can both reason AND act, not just advise.
+# The voice brain is Haiku (fast, cheap). When a question is genuinely hard or
+# risky it consults ONE advisor: a single Opus hop, in-process, sharing the same
+# fleet tools so it can both reason AND act. This replaces the old confusing
+# setup — a Haiku→Sonnet→Opus ladder AND a separate slow backend advisor session
+# — with one clear, fast escalation the user can actually follow.
 HAIKU_MODEL = "claude-haiku-4-5"
-SONNET_MODEL = "claude-sonnet-4-6"
 OPUS_MODEL = "claude-opus-4-8"
+SONNET_MODEL = "claude-sonnet-4-6"
+# The advisor is Opus; if it's momentarily unavailable (e.g. rate-limited) fall
+# back to Sonnet so a consult still returns something useful. Still ONE advisor
+# from the user's view — just resilient, not a recursive ladder.
+ADVISOR_MODELS = [OPUS_MODEL, SONNET_MODEL]
+# Appended to the system prompt when Opus is answering as the advisor, so it
+# knows it may ACT on the fleet, not just hand back advice.
+ADVISOR_NOTE = (
+    "\n\nYou are the advisor: the stronger model the voice assistant consults "
+    "when a question is hard or ambiguous or an action is risky. You have the "
+    "SAME fleet tools and may ACT directly — reply to a session, answer a "
+    "blocked prompt, close a session — in addition to reasoning. Re-read live "
+    "state with get_fleet_status / list_sessions before acting, stay within the "
+    "speaking user's sessions, and never touch the voice session itself. Answer "
+    "in at most 3 short, plain spoken sentences; it is read aloud."
+)
 VOICE_PROMPT = (
     "You are a hands-free voice assistant inside lfg, a dashboard for managing "
     "AI coding-agent sessions (Claude Code and similar). Reply in at most 1-2 "
     "short, plain spoken sentences. No markdown, no code blocks, no bullet "
     "lists, no symbols meant to be read aloud. Be direct and conversational.\n"
+    "WHO YOU SERVE: you are scoped to ONE person — the user speaking to you. The "
+    "snapshot and list_sessions show only THEIR sessions, and you act only on "
+    "their fleet. 'My project', 'it', 'this', or 'that session' (with no name) "
+    "means their currently focused session — resolve it from the FOCUS line in "
+    "your context before acting.\n"
     "CRITICAL for speed and not being annoying:\n"
     "- Answer in ONE short sentence. NEVER narrate or preface — no 'let me "
     "check', 'one moment', 'I'm checking'. Just answer.\n"
+    "- NEVER claim an action happened until you have seen its tool result. Say "
+    "what you are ABOUT to do (present tense), never that it is already done, "
+    "until the result comes back — then confirm it, or say it failed.\n"
     "- Do NOT call a tool unless the user CLEARLY asks about session/fleet "
     "status or to act on a specific session. For greetings/small talk, just "
     "reply — no tools.\n"
     "- If what you heard is short, empty, unclear, or garbled, do NOT guess and "
     "do NOT act — briefly ask the user to repeat.\n"
+    "- For a SIMPLE ambiguity (which of two sessions did they mean?), just ASK "
+    "the user in one short sentence. Do NOT consult the advisor for that.\n"
     "If something needs a long answer or code, give a one-sentence summary and "
     "offer to open it in a session.\n\n"
-    "You can act on the fleet with tools. Resolve a session the user names "
-    "against the snapshot/list, then:\n"
-    "- get_fleet_status — re-read live status of every session. The snapshot in "
-    "your context was captured when you connected and goes stale fast: ALWAYS "
-    "call this first whenever the user asks what's happening now, the current "
-    "status, whether a session finished/changed, or anything time-sensitive. "
-    "Answer from the fresh result, not the connect-time snapshot.\n"
-    "- list_sessions — get session ids + titles (needed before replying).\n"
+    "You can act on the fleet with tools. ALWAYS resolve a session to its exact "
+    "id (from list_sessions or the snapshot) BEFORE reply_to_session, "
+    "answer_session_prompt, or close_session — never act on a guessed id.\n"
+    "- get_fleet_status — re-read live status of the user's sessions. The "
+    "snapshot in your context goes stale fast: ALWAYS call this first whenever "
+    "the user asks what's happening now, the current status, whether a session "
+    "finished/changed, or anything time-sensitive. Answer from the fresh "
+    "result, not the connect-time snapshot.\n"
+    "- list_sessions — get session ids + titles (needed before acting on one).\n"
     "- list_repos — list the projects/repos a new session can start in (name + "
     "path); use it to resolve the folder when the user names a project.\n"
-    "- create_session — start a NEW coding-agent session to work on a task. Pass "
-    "a clear one-line `prompt`; when the user names a project, first call "
-    "list_repos and pass that repo's path as `cwd`. You CAN create sessions from "
-    "voice — do it when the user asks, don't tell them to use the dashboard.\n"
+    "- create_session — start a NEW coding-agent session, either to DO a task or "
+    "to GO FIND OUT something the user wants to know (spin up an agent to "
+    "investigate, e.g. 'check our analytics' or 'see how the auth fix is "
+    "going'). Pass a clear one-line `prompt`. It defaults to the user's focused "
+    "project; pass `cwd` (from list_repos) only when they name a different one. "
+    "You CAN create sessions from voice — do it when the user asks, don't tell "
+    "them to use the dashboard.\n"
     "- reply_to_session — send an instruction to another session.\n"
     "- answer_session_prompt — pick an option for a session that is BLOCKED on "
     "a permission/plan prompt (use the option index from its snapshot line).\n"
-    "- close_session — shut down / end a session the user is done with. Make "
-    "sure you have the right session id (resolve it first); never close your "
-    "own voice session.\n"
-    "- consult_advisor — escalate to a STRONGER, smarter model. Use this "
-    "WHENEVER you are not confident: a hard or ambiguous question, a risky or "
-    "destructive action (like closing the wrong session), unsure which tool to "
-    "call, or anything that needs careful reasoning. The advisor has the same "
-    "fleet tools and can act on the fleet itself, so prefer escalating over "
-    "guessing. It takes a moment, so BEFORE you call it say one short spoken "
+    "- close_session — shut down / end a session the user is done with. Resolve "
+    "the exact id first; never close your own voice session.\n"
+    "- consult_advisor — hand a genuinely HARD or RISKY question to a stronger "
+    "deep-thinking model that has full repo + tool access and can act on the "
+    "fleet itself. Use it ONLY when careful reasoning is truly needed, NOT for "
+    "simple disambiguation. It takes a while, so first say one short spoken "
     "sentence telling the user you're checking with the advisor.\n"
     "Prefer answer_session_prompt over reply_to_session when a session is "
     "waiting on a choice. Never act on your own voice session."
-)
-# Appended to the system prompt when a stronger model is handling an escalation,
-# so it knows it can act on the fleet — not just hand back advice.
-ESCALATION_NOTE = (
-    "\n\nYou are the escalation advisor: a stronger model the voice assistant "
-    "consults when it is unsure, a question is hard or ambiguous, or an action "
-    "is risky. You have the SAME fleet tools and may ACT directly — reply to a "
-    "session, answer a blocked prompt, close a session — in addition to "
-    "reasoning. Re-read live state with get_fleet_status / list_sessions before "
-    "acting, and never touch the voice session itself. If the question is still "
-    "beyond you, you may escalate once more. Answer in at most 3 short, plain "
-    "spoken sentences; it is read aloud."
 )
 
 # Module state for the single active voice job (room "voice", one job at a time).
 ROOM: rtc.Room | None = None
 SYSTEM_PROMPT: str = VOICE_PROMPT
+# The lfg user the current speaker is (set from the human participant's `lfg.user`
+# attribute, which the web orb publishes from its chosen user). Empty / "__all"
+# means "no scoping" — show the whole fleet, as before. When set, every fleet
+# read and action is filtered to this user's sessions so one person never sees
+# or touches another's work.
+CURRENT_USER: str = ""
+# Where the lfg-sessions skill persists which session the user is focused on
+# ("it" / "my project"). Read fresh each turn so it tracks what they're on.
+FOCUS_FILE = Path.home() / ".lfg" / "active-session"
 
 
 def _oauth_token() -> str | None:
@@ -123,7 +148,13 @@ _http: aiohttp.ClientSession | None = None
 async def get_http() -> aiohttp.ClientSession:
     global _http
     if _http is None or _http.closed:
-        _http = aiohttp.ClientSession()
+        # Bound every request so a stalled Anthropic/LFG call can't pin the voice
+        # turn open. Without this the LLM stream never finishes and the orb is
+        # stuck narrating "Thinking…" (LiveKit's lk.agent.state stays "thinking"
+        # for the whole life of LfgLLMStream). connect/sock_read are short; total
+        # leaves headroom for a slow deep-think consult.
+        timeout = aiohttp.ClientTimeout(total=60, connect=10, sock_read=45)
+        _http = aiohttp.ClientSession(timeout=timeout)
     return _http
 
 
@@ -187,17 +218,17 @@ class LfgSTT(stt.STT):
 
 
 # ── fleet tools (Anthropic tool-use, backed by the lfg HTTP API) ─────────────
-# Every brain in the ladder (Haiku, Sonnet, Opus) gets these same fleet tools,
-# so a stronger model can act on the fleet exactly like the voice brain can.
+# The voice brain (Haiku) gets these tools plus consult_advisor; the advisor it
+# escalates to is a separate, more powerful backend session — see consult_advisor.
 FLEET_TOOLS = [
     {
         "name": "get_fleet_status",
-        "description": "Re-read the live status of every lfg session (blocked / working / idle, with the pending question for blocked ones).",
+        "description": "Re-read the live status of the user's lfg sessions (blocked / working / idle, with the pending question for blocked ones).",
         "input_schema": {"type": "object", "properties": {}},
     },
     {
         "name": "list_sessions",
-        "description": "List sessions with their ids and titles. Call this to resolve a session id before reply_to_session, answer_session_prompt, or close_session.",
+        "description": "List the user's sessions with their ids and titles. Call this to resolve a session id before reply_to_session, answer_session_prompt, or close_session.",
         "input_schema": {"type": "object", "properties": {}},
     },
     {
@@ -207,7 +238,7 @@ FLEET_TOOLS = [
     },
     {
         "name": "create_session",
-        "description": "Start a NEW coding-agent session to work on a task. Give it a clear one-line instruction in `prompt`. Optionally pass `cwd` (a repo path from list_repos) to start it in a specific project; omit to use the default lfg repo. Returns the new session id. Slow (a few seconds) — say a short spoken preamble first.",
+        "description": "Start a NEW coding-agent session to work on a task OR to investigate/find out something the user asked about. Give it a clear one-line instruction in `prompt`. Optionally pass `cwd` (a repo path from list_repos); omit to default to the user's focused project. Returns the new session id. Slow (a few seconds) — say a short spoken preamble first.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -252,10 +283,11 @@ FLEET_TOOLS = [
     },
 ]
 
-# The escalation tool — hands a hard/uncertain decision up to a stronger model.
+# The escalation tool — hands a hard/risky question to the single deep-think
+# advisor (a stronger Opus backend session with full repo + tool access).
 ESCALATE_TOOL = {
     "name": "consult_advisor",
-    "description": "Escalate to a stronger, smarter model when you are NOT confident: a hard or ambiguous question, a risky/destructive action, unsure which tool to call, or anything needing careful reasoning. The advisor shares your fleet tools and can act on the fleet itself. Returns a short spoken answer.",
+    "description": "Escalate a genuinely HARD or RISKY question to the deep-think advisor: a stronger model running as a real lfg session with full repo + tool access, so it can both reason carefully AND act on the fleet. Use only when careful reasoning is truly needed, not for simple disambiguation (just ask the user). Slow — say a short spoken preamble first. Returns a short spoken answer.",
     "input_schema": {
         "type": "object",
         "properties": {"question": {"type": "string"}},
@@ -263,13 +295,8 @@ ESCALATE_TOOL = {
     },
 }
 
-
-def tools_for(model: str) -> list[dict]:
-    """Tools available to each rung of the ladder. Opus is the top — no further
-    escalation — everyone below it can escalate."""
-    if model == OPUS_MODEL:
-        return FLEET_TOOLS
-    return FLEET_TOOLS + [ESCALATE_TOOL]
+# The voice brain always has the fleet tools plus the one advisor escalation.
+BRAIN_TOOLS = FLEET_TOOLS + [ESCALATE_TOOL]
 
 
 async def set_activity(state: str) -> None:
@@ -280,6 +307,93 @@ async def set_activity(state: str) -> None:
         await ROOM.local_participant.set_attributes({"lfg.activity": state})
     except Exception:
         pass
+
+
+# Short, spoken-style labels the orb shows while a tool is running, so the user
+# sees WHAT the brain is doing (not just that it's busy). Streamed to the orb
+# frontend via the `lfg.tool` participant attribute.
+TOOL_LABELS = {
+    "get_fleet_status": "Checking fleet status",
+    "list_sessions": "Listing sessions",
+    "list_repos": "Listing repos",
+    "create_session": "Creating a session",
+    "reply_to_session": "Messaging a session",
+    "answer_session_prompt": "Answering a prompt",
+    "close_session": "Closing a session",
+    "consult_advisor": "Consulting the advisor",
+}
+
+# Spoken-style preambles said the instant a tool call starts, so the user hears
+# that work is happening before any (possibly slow) tool runs — never dead air
+# through "thinking". Present-tense intent only ("about to" / "one moment"),
+# never a completion claim (the result isn't in yet). Used only as a fallback
+# when the model didn't already produce its own spoken text on the tool turn.
+TOOL_PREAMBLES = {
+    "get_fleet_status": "Let me check on the fleet, one moment.",
+    "list_sessions": "Let me pull up the sessions, one moment.",
+    "list_repos": "Let me look at the repos, one moment.",
+    "create_session": "Okay, spinning up a session for that, one moment.",
+    "reply_to_session": "Okay, sending that over.",
+    "answer_session_prompt": "Okay, answering that prompt, one moment.",
+    "close_session": "One moment, closing that out.",
+    "consult_advisor": "Let me check with the advisor, one moment.",
+}
+# Said when a tool call has no specific preamble above, so every tool call still
+# gets spoken acknowledgement.
+GENERIC_PREAMBLE = "One moment, let me take care of that."
+
+
+async def set_tool(label: str) -> None:
+    """Publish the current tool/thinking detail (a short label, or "" to clear)
+    to the orb via the `lfg.tool` participant attribute."""
+    if ROOM is None:
+        return
+    try:
+        await ROOM.local_participant.set_attributes({"lfg.tool": label})
+    except Exception:
+        pass
+
+
+# ── speaker scoping + focus (who is talking, and what project they're on) ─────
+def _refresh_current_user() -> None:
+    """Read the speaking user from the human participant's `lfg.user` attribute
+    (published by the web orb) and make CURRENT_USER authoritative for whoever is
+    in the room *right now*.
+
+    This worker is long-lived and the "voice" room is reused across taps, so we
+    must CLEAR CURRENT_USER when no human is publishing an `lfg.user` — otherwise
+    a new speaker who hasn't chosen a user inherits the previous speaker's
+    identity, and any session they create gets assigned to the wrong user. On a
+    fresh tap the orb publishes `lfg.user` a beat after connecting, so this may
+    momentarily resolve to "" (unscoped → whole fleet, and a create lands
+    unassigned rather than mis-assigned); `participant_attributes_changed`
+    repopulates it the instant the attribute lands."""
+    global CURRENT_USER
+    if ROOM is None:
+        return
+    found = ""
+    try:
+        for p in ROOM.remote_participants.values():
+            u = ((p.attributes or {}).get("lfg.user") or "").strip()
+            if u and u != "__all":
+                found = u
+                break
+    except Exception:
+        return
+    CURRENT_USER = found
+
+
+def _read_focus() -> str:
+    """The user's currently focused session id (what 'it' / 'my project' means)."""
+    try:
+        return FOCUS_FILE.read_text().strip()
+    except Exception:
+        return ""
+
+
+def _user_qs() -> str:
+    """Query suffix that scopes a fleet read to the speaking user (or "")."""
+    return f"?user={CURRENT_USER}" if CURRENT_USER else ""
 
 
 async def _lfg_get(path: str) -> dict:
@@ -298,23 +412,44 @@ async def _lfg_post(path: str, payload: dict) -> dict:
         return j if r.status == 200 else {"error": f"http {r.status}", **j}
 
 
+async def _scoped_sessions() -> list[dict]:
+    """Live sessions visible to the speaking user: their own (by assignedUser)
+    plus whatever they're focused on. With no CURRENT_USER, the whole fleet."""
+    j = await _lfg_get("/api/sessions")
+    focus = _read_focus()
+    out = []
+    for s in j.get("sessions", []):
+        if not s.get("sessionId"):
+            continue
+        if (
+            CURRENT_USER
+            and s.get("assignedUser") != CURRENT_USER
+            and s.get("sessionId") != focus
+        ):
+            continue
+        out.append(s)
+    return out
+
+
 async def run_tool(name: str, args: dict) -> str:
-    """Execute one fleet tool; returns a compact string for the tool_result."""
+    """Execute one fleet tool; returns a compact string for the tool_result.
+    Reads and actions are scoped to the speaking user (CURRENT_USER)."""
     try:
         if name == "get_fleet_status":
-            return (await _lfg_get("/api/voice/snapshot")).get("snapshot", "(none)")
+            return (
+                await _lfg_get(f"/api/voice/snapshot{_user_qs()}")
+            ).get("snapshot", "(none)")
         if name == "list_sessions":
-            j = await _lfg_get("/api/sessions")
+            focus = _read_focus()
             rows = []
-            for s in j.get("sessions", []):
-                if not s.get("sessionId"):
-                    continue
+            for s in await _scoped_sessions():
                 rows.append(
                     {
                         "id": s.get("sessionId"),
                         "title": (s.get("title") or "")[:60],
                         "user": s.get("assignedUser"),
                         "last": (s.get("lastUserText") or "")[:60],
+                        "focused": s.get("sessionId") == focus,
                     }
                 )
             return json.dumps(rows)
@@ -332,8 +467,20 @@ async def run_tool(name: str, args: dict) -> str:
                 return "need a task/prompt to start a session"
             payload: dict = {"prompt": prompt}
             cwd = (args.get("cwd") or "").strip()
+            # Default the working folder to the user's focused project, so a
+            # voice "go check on X" spins up in the right repo without them
+            # naming it. Explicit cwd from the model wins.
+            if not cwd:
+                focus = _read_focus()
+                if focus:
+                    for s in await _scoped_sessions():
+                        if s.get("sessionId") == focus and s.get("cwd"):
+                            cwd = s["cwd"]
+                            break
             if cwd:
                 payload["cwd"] = cwd
+            if CURRENT_USER:
+                payload["user"] = CURRENT_USER
             await set_activity("replying")
             try:
                 j = await _lfg_post("/api/sessions/new", payload)
@@ -343,27 +490,35 @@ async def run_tool(name: str, args: dict) -> str:
                 sid = j.get("sessionId") or j.get("tmuxName") or ""
                 return f"created session {sid}"
             return j.get("error") or "create failed"
-        if name == "reply_to_session":
-            await set_activity("replying")
-            try:
-                j = await _lfg_post(
-                    f"/api/sessions/{args.get('session_id')}/send",
-                    {"text": args.get("text", "")},
+        if name in ("reply_to_session", "answer_session_prompt", "close_session"):
+            # Resolve-before-act: never act on a guessed/blank id, and never reach
+            # outside the speaking user's scope. Force the model to list first.
+            sid = (args.get("session_id") or "").strip()
+            visible = {s.get("sessionId") for s in await _scoped_sessions()}
+            if not sid or sid not in visible:
+                return (
+                    "couldn't find that session for you — call list_sessions to "
+                    "resolve the exact id first, then try again"
                 )
-            finally:
-                await set_activity("")
-            return "sent" if j.get("ok") else (j.get("error") or "send failed")
-        if name == "answer_session_prompt":
-            j = await _lfg_post(
-                f"/api/sessions/{args.get('session_id')}/answer",
-                {"index": int(args.get("option_index", 0))},
-            )
-            return "answered" if j.get("ok") else (j.get("error") or "answer failed")
-        if name == "close_session":
-            j = await _lfg_post(
-                f"/api/sessions/{args.get('session_id')}/close", {}
-            )
-            return j.get("error") or "closed"
+            if name == "reply_to_session":
+                await set_activity("replying")
+                try:
+                    j = await _lfg_post(
+                        f"/api/sessions/{sid}/send",
+                        {"text": args.get("text", "")},
+                    )
+                finally:
+                    await set_activity("")
+                return "sent" if j.get("ok") else (j.get("error") or "send failed")
+            if name == "answer_session_prompt":
+                j = await _lfg_post(
+                    f"/api/sessions/{sid}/answer",
+                    {"index": int(args.get("option_index", 0))},
+                )
+                return "answered" if j.get("ok") else (j.get("error") or "answer failed")
+            if name == "close_session":
+                j = await _lfg_post(f"/api/sessions/{sid}/close", {})
+                return "closed" if (j.get("ok") or not j.get("error")) else j["error"]
     except Exception as e:
         return f"tool error: {e}"
     return f"unknown tool {name}"
@@ -405,30 +560,41 @@ async def anthropic_call(
         return None
 
 
-# ── LLM: the brain ladder (Haiku → Sonnet → Opus), all sharing fleet tools ───
-# One tool-use loop, parameterized by model. The voice brain (Haiku) runs it
-# live and speaks via `emit`; an escalation runs the SAME loop on a stronger
-# model with the SAME tools and just hands its answer back up the ladder.
-async def escalate(from_model: str, question: str) -> str:
-    """Hand a hard/uncertain decision to the next model up. Returns its answer."""
-    target = SONNET_MODEL if from_model == HAIKU_MODEL else OPUS_MODEL
-    print(f"[voice] escalate {from_model} -> {target}: {question[:80]}", flush=True)
+# ── the advisor: ONE in-process Opus hop ─────────────────────────────────────
+# The voice brain (Haiku) handles everything live. When a question is genuinely
+# hard or risky, it consults Opus ONCE — same fleet tools, so the advisor can
+# both reason and act. The advisor does NOT get consult_advisor itself, so there
+# is no recursive escalation and exactly one, fast, legible advisor.
+async def consult_advisor(question: str) -> str:
+    """Run one Opus pass over a hard/risky question and return its spoken answer.
+    Opus shares the fleet tools (it can act) but cannot escalate further."""
+    q = (question or "").strip() or "Please advise."
+    print(f"[voice] consult advisor: {q[:80]}", flush=True)
     await set_activity("consulting")
     try:
-        msgs: list[dict] = [{"role": "user", "content": question or "Please advise."}]
-        answer = await run_brain(
-            msgs, model=target, system=SYSTEM_PROMPT + ESCALATION_NOTE
-        )
+        for model in ADVISOR_MODELS:
+            # Fresh msgs each attempt — run_brain mutates it with the tool loop.
+            answer = await run_brain(
+                [{"role": "user", "content": q}],
+                model=model,
+                system=SYSTEM_PROMPT + ADVISOR_NOTE,
+                tools=FLEET_TOOLS,  # no consult_advisor → no recursion
+            )
+            if answer:
+                print(f"[voice] advisor ({model}) answered", flush=True)
+                return answer
     finally:
         await set_activity("")
-    return answer or "(no answer from the advisor)"
+    return "The advisor is busy right now — give me a moment and ask again."
 
 
-async def run_brain(msgs, *, model: str, system: str, emit=None) -> str:
+async def run_brain(msgs, *, model: str, system: str, emit=None, tools=None) -> str:
     """Tool-use loop at `model`. Speaks each text chunk via emit() when given
-    (the live voice turn); always returns the final assistant text (so an
-    escalation can hand it back to the caller)."""
-    tools = tools_for(model)
+    (the live voice turn); always returns the final assistant text. `tools`
+    defaults to the full brain set (fleet + consult_advisor); the advisor passes
+    FLEET_TOOLS so it can act but not escalate again."""
+    if tools is None:
+        tools = BRAIN_TOOLS
     for _ in range(6):
         resp = await anthropic_call(
             msgs, system, model=model, tools=tools, max_tokens=600
@@ -444,19 +610,18 @@ async def run_brain(msgs, *, model: str, system: str, emit=None) -> str:
             # Speak any preamble the model produced alongside the tool call (e.g.
             # "let me check with the advisor"). Without this, text blocks on a
             # tool-use turn are dropped and the user hears dead air through a
-            # slow consult. Guarantee a "hold on" even with no preamble.
+            # slow consult. Guarantee a "hold on" even with no preamble — and
+            # keep it present-tense intent ("about to"), never "done" (the model
+            # is told never to claim completion before it sees the result).
             preamble = "".join(
                 b.get("text", "") for b in blocks if b.get("type") == "text"
             ).strip()
             if not preamble:
-                if "consult_advisor" in tool_names:
-                    preamble = "Let me check with a stronger model, one moment."
-                elif "reply_to_session" in tool_names:
-                    preamble = "Okay, sending that over now."
-                elif "close_session" in tool_names:
-                    preamble = "Okay, closing that session now."
-                elif "create_session" in tool_names:
-                    preamble = "Okay, spinning up a new session for that, one moment."
+                # Guarantee spoken feedback for EVERY tool call (not just a
+                # hand-picked few) — pick the first tool's preamble, falling
+                # back to a generic one so no tool ever runs in silence.
+                first_tool = next((n for n in tool_names if n), "")
+                preamble = TOOL_PREAMBLES.get(first_tool, GENERIC_PREAMBLE)
             if preamble and emit:
                 print(f"[voice] say (preamble): {preamble}", flush=True)
                 emit(preamble)
@@ -467,10 +632,16 @@ async def run_brain(msgs, *, model: str, system: str, emit=None) -> str:
                     continue
                 name = b.get("name", "")
                 args = b.get("input") or {}
-                if name == "consult_advisor":
-                    out = await escalate(model, args.get("question", ""))
-                else:
-                    out = await run_tool(name, args)
+                # Stream what we're doing to the orb so it can narrate the
+                # tool call (and, for a consult, the "thinking" hand-off).
+                await set_tool(TOOL_LABELS.get(name, name))
+                try:
+                    if name == "consult_advisor":
+                        out = await consult_advisor(args.get("question", ""))
+                    else:
+                        out = await run_tool(name, args)
+                finally:
+                    await set_tool("")
                 results.append(
                     {"type": "tool_result", "tool_use_id": b.get("id"), "content": out}
                 )
@@ -509,8 +680,32 @@ class LfgLLMStream(llm.LLMStream):
                 )
             )
 
-        # The voice brain is Haiku; it escalates up the ladder when unsure.
-        await run_brain(msgs, model=HAIKU_MODEL, system=SYSTEM_PROMPT, emit=emit)
+        # Make sure we know who is speaking before scoping any fleet read.
+        _refresh_current_user()
+
+        # The voice brain is Haiku; it consults the advisor when truly unsure.
+        #
+        # This MUST finish (and the stream close) no matter what: LiveKit holds
+        # lk.agent.state at "thinking" for the entire life of this stream, so a
+        # hang or an unhandled exception here leaves the orb stuck "Thinking…"
+        # forever. Bound the whole turn, speak a graceful fallback on failure,
+        # and always clear the orb's activity/tool detail on the way out.
+        try:
+            await asyncio.wait_for(
+                run_brain(msgs, model=HAIKU_MODEL, system=SYSTEM_PROMPT, emit=emit),
+                timeout=90,
+            )
+        except asyncio.TimeoutError:
+            print("[voice] run_brain timed out — recovering", flush=True)
+            emit("Sorry, that took too long. Could you try again?")
+        except Exception as e:
+            print(f"[voice] run_brain failed: {e} — recovering", flush=True)
+            emit("Sorry, I hit a snag there. Could you say that again?")
+        finally:
+            # Drop any lingering deep-work / tool detail so the orb doesn't keep
+            # showing a stale "Consulting…" / tool label after the turn ends.
+            await set_activity("")
+            await set_tool("")
 
 
 class LfgLLM(llm.LLM):
@@ -583,19 +778,26 @@ async def make_briefing(snapshot: str) -> str:
     return "Hey, I'm online. Tap to ask me anything about your sessions."
 
 
-# ── worker entrypoint ───────────────────────────────────────────────────────
-async def entrypoint(ctx: JobContext) -> None:
-    global ROOM, SYSTEM_PROMPT
-    await ctx.connect()
-    ROOM = ctx.room
-
-    # Seed the system prompt with live fleet status + the user's standing context
-    # so every reply is fleet-aware from turn one.
+# ── per-start seeding ───────────────────────────────────────────────────────
+async def seed_system_prompt() -> str:
+    """Refresh the global system prompt from a live, user-scoped fleet snapshot,
+    the user's standing context, and their focused session. Returns the raw
+    snapshot (for the briefing)."""
+    global SYSTEM_PROMPT
     snapshot = ""
     try:
-        snap = await _lfg_get("/api/voice/snapshot")
+        snap = await _lfg_get(f"/api/voice/snapshot{_user_qs()}")
         snapshot = snap.get("snapshot", "")
         parts = [VOICE_PROMPT]
+        focus = _read_focus()
+        if focus:
+            parts.append(
+                "=== FOCUS ===\n"
+                f"The user's currently focused session id is {focus}. When they "
+                "say 'it', 'this', 'my project', or 'the session' without naming "
+                "one, they mean this. New sessions default to its project.\n"
+                "=== END FOCUS ==="
+            )
         if snapshot:
             parts.append(
                 "=== SESSION SNAPSHOT (point-in-time, captured when you "
@@ -609,15 +811,63 @@ async def entrypoint(ctx: JobContext) -> None:
         SYSTEM_PROMPT = "\n\n".join(parts)
     except Exception:
         SYSTEM_PROMPT = VOICE_PROMPT
+    return snapshot
 
-    session = AgentSession(stt=LfgSTT(), llm=LfgLLM(), tts=LfgTTS())
-    await session.start(Agent(instructions="lfg voice assistant."), room=ctx.room)
 
+async def start_session(session: AgentSession, *, clear: bool) -> None:
+    """Begin a voice interaction: optionally wipe any prior conversation, refresh
+    the system prompt, and speak a proactive briefing.
+
+    The room ("voice") is persistent and the agent stays in it, so a reconnect
+    reuses the SAME AgentSession — its chat_ctx still holds the previous chat.
+    Clearing it here means each fresh start (a tap of the orb) begins clean, with
+    no leftover context carried over from the last conversation."""
+    if clear:
+        try:
+            await session.current_agent.update_chat_ctx(llm.ChatContext.empty())
+            print("[voice] cleared previous context (new start)", flush=True)
+        except Exception:
+            pass
+    # Resolve who is speaking before scoping the seeded snapshot to them.
+    _refresh_current_user()
+    snapshot = await seed_system_prompt()
     # Speak a proactive briefing the moment we connect (no user turn needed).
     try:
         await session.say(await make_briefing(snapshot))
     except Exception:
         pass
+
+
+# ── worker entrypoint ───────────────────────────────────────────────────────
+async def entrypoint(ctx: JobContext) -> None:
+    global ROOM
+    await ctx.connect()
+    ROOM = ctx.room
+
+    session = AgentSession(stt=LfgSTT(), llm=LfgLLM(), tts=LfgTTS())
+
+    # A fresh tap of the orb shows up here as a participant (re)joining the
+    # persistent "voice" room. Clear the prior conversation and re-brief so each
+    # start is a clean slate — this fires on reconnects, where the job/session
+    # (and its accumulated chat_ctx) outlived the previous browser disconnect.
+    @ctx.room.on("participant_connected")
+    def _on_participant(_p: rtc.RemoteParticipant) -> None:
+        asyncio.create_task(start_session(session, clear=True))
+
+    # The web orb publishes the speaking user as the `lfg.user` attribute,
+    # sometimes a beat after connecting — keep CURRENT_USER in step with it.
+    @ctx.room.on("participant_attributes_changed")
+    def _on_attrs(_changed, _p) -> None:
+        _refresh_current_user()
+
+    await session.start(Agent(instructions="lfg voice assistant."), room=ctx.room)
+
+    # Every start clears prior context. A normal reconnect dispatches a fresh job
+    # (this entrypoint) with an already-empty session, so the clear is a no-op
+    # there — but it makes "each start begins clean" an explicit invariant that
+    # also holds if the session is ever kept warm across disconnects
+    # (close_on_disconnect=False), where the participant handler above clears it.
+    await start_session(session, clear=True)
 
 
 if __name__ == "__main__":

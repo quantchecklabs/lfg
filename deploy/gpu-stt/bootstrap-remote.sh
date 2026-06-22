@@ -66,4 +66,41 @@ if [ -f "$APP/run-tts.sh" ] && [ -d /opt/CosyVoice/pretrained_models/CosyVoice2-
     echo "[bootstrap] TTS already healthy"
   fi
 fi
+
+# Parakeet STT (English / multilingual-v3) — optional STT engine on its own port
+# (default :8091; :8087-8090 are taken by the STT/TTS engines). Opt-in via
+# PARAKEET_ENABLE=1 in stt.env so the heavy NeMo deps only land when wanted.
+# Point lfg's STT_UPSTREAM at :$PARAKEET_PORT to make it the orb default.
+PPORT="${PARAKEET_PORT:-8091}"
+parakeet_healthy() {
+  python - "$PPORT" <<'PY' 2>/dev/null
+import urllib.request, sys
+try:
+    urllib.request.urlopen(f"http://127.0.0.1:{sys.argv[1]}/health", timeout=3); sys.exit(0)
+except Exception:
+    sys.exit(1)
+PY
+}
+if [ "${PARAKEET_ENABLE:-0}" = "1" ] && [ -f "$APP/parakeet_stt.py" ]; then
+  python -c "import nemo.collections.asr" 2>/dev/null \
+    || pip install -q --no-input "nemo_toolkit[asr]" soundfile scipy "numpy<2" fastapi "uvicorn[standard]"
+  if [ ! -f "$APP/run-parakeet.sh" ]; then
+    cat > "$APP/run-parakeet.sh" <<'SH'
+#!/usr/bin/env bash
+set -a; [ -f /opt/stt/stt.env ] && . /opt/stt/stt.env; set +a
+export PATH=/opt/conda/bin:$PATH
+exec python /opt/stt/parakeet_stt.py
+SH
+    chmod +x "$APP/run-parakeet.sh"
+  fi
+  if ! parakeet_healthy; then
+    echo "[bootstrap] starting Parakeet STT service..."
+    tmux kill-session -t parakeet 2>/dev/null || true
+    tmux new-session -d -s parakeet "bash $APP/run-parakeet.sh > $APP/parakeet.log 2>&1"
+    for i in $(seq 1 45); do parakeet_healthy && break; sleep 2; done
+    parakeet_healthy && echo "[bootstrap] Parakeet up on :$PPORT" || echo "[bootstrap] Parakeet not healthy yet (lazy model load)"
+  else
+    echo "[bootstrap] Parakeet already healthy"
+  fi
+fi
 echo "[bootstrap] done"

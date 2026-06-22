@@ -42,7 +42,7 @@ After=network-online.target
 Wants=network-online.target
 [Service]
 EnvironmentFile=%h/.config/lfg-stt-tunnel.env
-ExecStart=/usr/bin/sshpass -e /usr/bin/ssh -N -T -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/home/dev/.ssh/known_hosts -p ${PORT} -L 127.0.0.1:8087:127.0.0.1:8087 -L 127.0.0.1:8088:127.0.0.1:8088 ${HOSTU}
+ExecStart=/usr/bin/sshpass -e /usr/bin/ssh -N -T -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/home/dev/.ssh/known_hosts -p ${PORT} -L 127.0.0.1:8087:127.0.0.1:8087 -L 127.0.0.1:8088:127.0.0.1:8088 -L 127.0.0.1:8089:127.0.0.1:8089 -L 127.0.0.1:8090:127.0.0.1:8090 -L 127.0.0.1:8091:127.0.0.1:8091 ${HOSTU}
 Restart=always
 RestartSec=5
 [Install]
@@ -58,8 +58,9 @@ ensure_service() {
   [ -n "${PORT:-}" ] && [ -n "${PW:-}" ] || { echo "no SSH endpoint"; return 1; }
   local SSHO="-p $PORT -o StrictHostKeyChecking=accept-new -o ConnectTimeout=25"
   sshpass -p "$PW" scp -P "$PORT" -o StrictHostKeyChecking=accept-new \
-    "$HERE/server.py" "$HERE/bootstrap-remote.sh" "$HOSTU:/opt/stt/" 2>/dev/null || { echo "scp failed (sshd not up?)"; return 1; }
-  printf 'STT_TOKEN=%s\nSTT_LANG=yue\nSTT_TO_TRADITIONAL=1\nSTT_PORT=8087\n' "$STT_TOKEN" \
+    "$HERE/server.py" "$HERE/parakeet_stt.py" "$HERE/bootstrap-remote.sh" "$HOSTU:/opt/stt/" 2>/dev/null || { echo "scp failed (sshd not up?)"; return 1; }
+  printf 'STT_TOKEN=%s\nSTT_LANG=yue\nSTT_TO_TRADITIONAL=1\nSTT_PORT=8087\nPARAKEET_ENABLE=%s\nPARAKEET_PORT=%s\n' \
+    "$STT_TOKEN" "${PARAKEET_ENABLE:-0}" "${PARAKEET_PORT:-8091}" \
     | sshpass -p "$PW" ssh $SSHO "$HOSTU" 'cat > /opt/stt/stt.env && chmod 600 /opt/stt/stt.env'
   sshpass -p "$PW" ssh $SSHO "$HOSTU" 'bash /opt/stt/bootstrap-remote.sh'
 }
