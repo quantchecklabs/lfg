@@ -12,13 +12,35 @@ Use Railway for a quick hosted preview. For day-to-day agent work, install
 
 1. Push this repository to GitHub.
 2. In Railway, create a new project from the GitHub repository.
-3. Railway will pick up `railway.json`.
+3. Railway will pick up `railway.json` and build the shared `Dockerfile`.
 4. Set any optional provider secrets in Railway variables, for example:
    - `ANTHROPIC_API_KEY`
    - `OPENAI_API_KEY`
    - `ELEVENLABS_API_KEY`
 
-`railway.json` binds the app to `0.0.0.0` and Railway's injected `$PORT`.
+The Dockerfile binds the app to `0.0.0.0` and maps Railway's injected `$PORT`
+to `LFG_PORT`.
+
+The Dockerfile installs the published bundled release from GitHub, not a live
+source build. This is intentional while the Vibes SDK path is not live for users.
+Publish `lfg-bundle.tar.gz` with `scripts/release.sh <tag>` before using this as
+a public one-click template.
+
+## Private Tailscale Access
+
+For a private Railway deployment, keep Public Networking disabled on the `lfg`
+service and add Railway's Tailscale Subnet Router template as a second service
+in the same project.
+
+Put the Tailscale auth key on the router service, not the `lfg` service:
+
+```env
+TS_AUTHKEY=tskey-auth-...
+```
+
+The `lfg` service itself does not run Tailscale on Railway. The router joins
+your tailnet and gives your devices access to Railway private service names such
+as `lfg.railway.internal`.
 
 ## Template Button
 
@@ -32,3 +54,7 @@ with the assigned template URL:
 
 Published Railway template URLs are assigned by Railway after publishing; this
 repo cannot know the final URL ahead of time.
+
+A polished one-click Railway template should include two services: `lfg` from
+this repo and the Tailscale router service with `TS_AUTHKEY` marked as a required
+variable.
