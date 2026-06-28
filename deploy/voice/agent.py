@@ -50,6 +50,7 @@ from livekit.agents import (
     Agent,
     AgentSession,
     JobContext,
+    RoomInputOptions,
     TurnHandlingOptions,
     WorkerOptions,
     cli,
@@ -103,14 +104,24 @@ VOICE_PROMPT = (
     "what you are ABOUT to do (present tense), never that it is already done, "
     "until the result comes back — then confirm it, or say it failed.\n"
     "- Do NOT call a tool unless the user CLEARLY asks about session/fleet "
-    "status or to act on a specific session. For greetings/small talk, just "
-    "reply — no tools.\n"
+    "status, asks to act on a specific session, or asks a technical/informative "
+    "question that warrants a session (see ANSWERING QUESTIONS below). For "
+    "greetings/small talk, just reply — no tools.\n"
     "- If what you heard is short, empty, unclear, or garbled, do NOT guess and "
     "do NOT act — briefly ask the user to repeat.\n"
     "- For a SIMPLE ambiguity (which of two sessions did they mean?), just ASK "
     "the user in one short sentence. Do NOT consult the advisor for that.\n"
-    "If something needs a long answer or code, give a one-sentence summary and "
-    "offer to open it in a session.\n\n"
+    "ANSWERING QUESTIONS: for casual, conversational, or quick factual questions, "
+    "just answer in one short sentence. But for any TECHNICAL or INFORMATIVE "
+    "question — how something works, what the code/repo/architecture does, why a "
+    "bug happens, how to build or fix something, research, or anything needing "
+    "real depth or accuracy — do NOT answer it yourself from memory. You are a "
+    "fast lightweight voice brain and would likely be shallow or wrong. Instead "
+    "create_session to spin up a coding agent that investigates with full repo and "
+    "tool access and answers it properly. Say one short sentence that you're "
+    "opening a session to look into it, then call create_session with a clear "
+    "one-line prompt capturing the question. Only skip the session if the user "
+    "explicitly says they just want your quick take.\n\n"
     "You can act on the fleet with tools. ALWAYS resolve a session to its exact "
     "id (from list_sessions or the snapshot) BEFORE reply_to_session, "
     "answer_session_prompt, or close_session — never act on a guessed id.\n"
@@ -119,7 +130,12 @@ VOICE_PROMPT = (
     "the user asks what's happening now, the current status, whether a session "
     "finished/changed, or anything time-sensitive. Answer from the fresh "
     "result, not the connect-time snapshot.\n"
-    "- list_sessions — get session ids + titles (needed before acting on one).\n"
+    "- list_sessions — get session ids + titles, plus agent kind, model, "
+    "project, status, and how long each has been idle (needed before acting on "
+    "one, and to answer which-session-is-which questions).\n"
+    "- search_transcript — search ONE session's full history for a word/phrase "
+    "and get matching snippets. Use it when the user asks what a session said, "
+    "decided, or worked on — the snapshot only shows its latest line.\n"
     "- list_repos — list the projects/repos a new session can start in (name + "
     "path); use it to resolve the folder when the user names a project.\n"
     "- create_session — start a NEW coding-agent session, either to DO a task or "
@@ -127,8 +143,9 @@ VOICE_PROMPT = (
     "investigate, e.g. 'check our analytics' or 'see how the auth fix is "
     "going'). Pass a clear one-line `prompt`. It defaults to the user's focused "
     "project; pass `cwd` (from list_repos) only when they name a different one. "
-    "For a Codex session, pass `agent` as `codex-aisdk` and optionally pass "
-    "`thinkingLevel` as low, medium, high, or xhigh. "
+    "Optionally pass `agent` (`codex-aisdk` for Codex, `opencode` for OpenCode) "
+    "and, for any Claude or Codex session, `thinkingLevel` as low, medium, high, "
+    "or xhigh to set how hard it reasons. "
     "You CAN create sessions from voice — do it when the user asks, don't tell "
     "them to use the dashboard.\n"
     "- reply_to_session — send an instruction to another session.\n"
@@ -147,7 +164,27 @@ VOICE_PROMPT = (
 
 # Module state for the single active voice job (room "voice", one job at a time).
 ROOM: rtc.Room | None = None
+# The system prompt stays FROZEN at the (large, stable) VOICE_PROMPT so it
+# prompt-caches across every turn and every connect. Volatile fleet status does
+# NOT live here — it goes in LIVE_CONTEXT and is injected into the message
+# stream instead (see seed_system_prompt / run_brain), so refreshing it never
+# invalidates the cached system+tools prefix.
 SYSTEM_PROMPT: str = VOICE_PROMPT
+# Volatile, per-connection context (fleet snapshot + focus + user context),
+# refreshed at connect AND on every fleet-completion push. Injected as a leading
+# conversation turn, never baked into the cached system prompt.
+LIVE_CONTEXT: str = ""
+# Set once we've launched the fleet-completion SSE watcher, so reconnects don't
+# stack duplicate watchers.
+_FLEET_WATCH_STARTED: bool = False
+# Rate-limit spoken push heads-ups so a burst of completions can't chatter.
+_LAST_PUSH_ANNOUNCE: float = 0.0
+PUSH_ANNOUNCE_GAP: float = 8.0
+# The live AgentSession (set in entrypoint) so the background advisor can speak
+# its answer out-of-band via session.say(), and the in-flight advisor task so a
+# consult is single-flight (one Opus pass at a time).
+SESSION: "AgentSession | None" = None
+_ADVISOR_TASK: "asyncio.Task | None" = None
 # The lfg user the current speaker is (set from the human participant's `lfg.user`
 # attribute, which the web orb publishes from its chosen user). Empty / "__all"
 # means "no scoping" — show the whole fleet, as before. When set, every fleet
@@ -198,6 +235,83 @@ def _pcm16_wav(pcm: bytes, rate: int, ch: int) -> bytes:
 def _wav_to_pcm(data: bytes) -> tuple[int, int, bytes]:
     w = wave.open(io.BytesIO(data), "rb")
     return w.getframerate(), w.getnchannels(), w.readframes(w.getnframes())
+
+
+# ── transcript gate: kill noise-/crowd-triggered turns ───────────────────────
+# The user's main symptom is ambient + crowd babble FALSELY triggering a turn:
+# VAD fires on diffuse noise, the clip reaches STT, and the model "transcribes"
+# it into a phantom phrase the brain then answers out loud. DTLN + the browser
+# noise-canceller cut most of this at the audio layer, and the VAD is tuned so
+# crowd babble shouldn't cross it — but anything that slips through still lands as
+# an ASR hallucination. Those hallucinations are overwhelmingly a tiny, known set
+# of fillers ("you", "thank you", "thanks for watching", "[BLANK_AUDIO]", a bare
+# "."). So we gate the COMMITTED transcript: a turn whose text is empty, has no
+# real word characters (punctuation/symbols only), or is exactly one known filler
+# is dropped — it never becomes a user message and never reaches run_brain.
+#
+# Deliberately CONSERVATIVE: we gate on "no lexical content" / known-filler-only,
+# never on length. Real short commands ("yes", "no", "stop", "go", "wait") have
+# word characters and aren't in the filler set, so they always pass.
+_NOISE_FILLERS = frozenset(
+    {
+        "you",
+        "you you",
+        "thank you",
+        "thank you.",
+        "thank you very much",
+        "thank you so much",
+        "thanks",
+        "thanks for watching",
+        "thanks for watching everyone",
+        "thank you for watching",
+        "please subscribe",
+        "subscribe",
+        "bye",
+        "bye bye",
+        "blank audio",
+        "silence",
+        "music",
+        "uh",
+        "um",
+        "hmm",
+        "mm",
+        "mhm",
+        # elongated variants of the above — ASR often emits these for crowd
+        # murmur / throat noise, and length-collapsing them is riskier than just
+        # listing them (so we never swallow a real short word).
+        "mhmm",
+        "mmhmm",
+        "umm",
+        "uhm",
+        "uhh",
+        "mmm",
+        "hmmm",
+        # backchannels (option B: reject all of them). These are the normalized,
+        # space-separated forms ASR emits for "mm-hmm"/"uh-huh"/"mm-mm"/"uh-uh"
+        # (the gate lowercases and turns punctuation into spaces before matching).
+        "mm hmm",
+        "uh huh",
+        "mm mm",
+        "uh uh",
+    }
+)
+
+
+def _normalize_transcript(text: str) -> str:
+    """Lowercase, drop every non-alphanumeric char to spaces, collapse runs.
+    Leaves only the lexical core, so "[BLANK_AUDIO]" -> "blank audio", "you." ->
+    "you", "..." / "♪♪" -> "" (no word chars)."""
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9\s]", " ", (text or "").lower())).strip()
+
+
+def _is_meaningful(text: str) -> bool:
+    """True only for a real user utterance. False for empty / punctuation-only /
+    known ASR noise-hallucination fillers — those are dropped before the brain.
+    Conservative by design: short genuine commands (yes/no/stop/go) pass."""
+    core = _normalize_transcript(text)
+    if not core:
+        return False  # empty, whitespace, or punctuation/symbols only
+    return core not in _NOISE_FILLERS
 
 
 def _speakable(md: str) -> str:
@@ -298,7 +412,12 @@ class LfgSpeechStream(stt.SpeechStream):
 
     async def _run(self) -> None:
         http = await get_http()
-        ws = await http.ws_connect(self._ws_url)
+        try:
+            ws = await http.ws_connect(self._ws_url)
+        except Exception as e:
+            print(f"[voice] stt ws connect FAILED ({self._ws_url}): {e}", flush=True)
+            raise
+        print("[voice] stt ws connected", flush=True)
 
         async def send_audio() -> None:
             # self._input_ch yields rtc.AudioFrame (already resampled to 16 kHz)
@@ -333,10 +452,16 @@ class LfgSpeechStream(stt.SpeechStream):
                 if kind == "partial":
                     if not spoke_start:
                         spoke_start = True
+                        print("[voice] hearing speech…", flush=True)
                         self._event_ch.send_nowait(
                             stt.SpeechEvent(type=stt.SpeechEventType.START_OF_SPEECH)
                         )
                     if text:
+                        # Mirror the in-progress transcript to the call UI. Fire
+                        # and forget — never await an attribute RPC inside the STT
+                        # read loop, or a slow signal round-trip would stall
+                        # reading the committed/final message that ends the turn.
+                        asyncio.create_task(set_user_transcript(text, False))
                         self._event_ch.send_nowait(
                             stt.SpeechEvent(
                                 type=stt.SpeechEventType.INTERIM_TRANSCRIPT,
@@ -344,18 +469,34 @@ class LfgSpeechStream(stt.SpeechStream):
                             )
                         )
                 elif kind == "final":
-                    if text:
+                    # Transcript gate: only emit a FINAL_TRANSCRIPT (which becomes
+                    # a user turn → run_brain) when the committed text is a real
+                    # utterance. Empty / punctuation-only / known-filler "turns"
+                    # are ambient or crowd noise the ASR hallucinated — drop them.
+                    if _is_meaningful(text):
                         print(f"[voice] user: {text}", flush=True)
-                    self._event_ch.send_nowait(
-                        stt.SpeechEvent(
-                            type=stt.SpeechEventType.FINAL_TRANSCRIPT,
-                            alternatives=[stt.SpeechData(language="en", text=text)],
+                        asyncio.create_task(set_user_transcript(text, True))
+                        self._event_ch.send_nowait(
+                            stt.SpeechEvent(
+                                type=stt.SpeechEventType.FINAL_TRANSCRIPT,
+                                alternatives=[stt.SpeechData(language="en", text=text)],
+                            )
                         )
-                    )
+                    elif text:
+                        print(f"[voice] dropped noise turn: {text!r}", flush=True)
+                    # Always close the speech segment, even on a dropped turn, so
+                    # the VAD/turn state machine never wedges waiting for an end —
+                    # the dropped turn simply produced no user message.
                     self._event_ch.send_nowait(
                         stt.SpeechEvent(type=stt.SpeechEventType.END_OF_SPEECH)
                     )
                     spoke_start = False
+                    # The STT (server-VAD) just declared the turn over. Force the
+                    # session to act on it now instead of waiting on the local VAD,
+                    # which under load stays stuck "speaking" and drops the turn.
+                    # Only on a real utterance — never resurrect a dropped-noise turn.
+                    if _is_meaningful(text):
+                        force_commit_turn()
 
         try:
             await asyncio.gather(send_audio(), recv_text())
@@ -386,7 +527,7 @@ FLEET_TOOLS = [
     },
     {
         "name": "list_sessions",
-        "description": "List the user's sessions with their ids and titles. Call this to resolve a session id before reply_to_session, answer_session_prompt, or close_session.",
+        "description": "List the user's sessions with their ids and titles. Each row also includes `agentFamily` (`opencode`, `codex`, or `claude`) and the raw `agent` kind (so you can tell OpenCode apart from regular Claude/Codex), plus `model`, `project` (repo it's working in), `status` (`ok` or `blocked`, with `blockedReason` when blocked), and `idle` (how long since its last activity, e.g. '3m'). Call this to resolve a session id before acting on one, or to answer questions about which session is which / what each is doing.",
         "input_schema": {"type": "object", "properties": {}},
     },
     {
@@ -396,11 +537,12 @@ FLEET_TOOLS = [
     },
     {
         "name": "create_session",
-        "description": "Start a NEW coding-agent session to work on a task OR to investigate/find out something the user asked about. Give it a clear one-line instruction in `prompt`. Optionally pass `cwd` (a repo path from list_repos); omit to default to the user's focused project. Optionally pass `agent` (`codex-aisdk` for Codex) and `thinkingLevel` for Codex reasoning effort. Returns the new session id. Slow (a few seconds) — say a short spoken preamble first.",
+        "description": "Start a NEW coding-agent session to work on a task OR to investigate/find out something the user asked about. Give it a clear one-line instruction in `prompt`. Optionally pass `cwd` (a repo path from list_repos); omit to default to the user's focused project. Optionally pass `agent` (`codex-aisdk` for Codex, `opencode` for OpenCode) and `thinkingLevel` (reasoning effort for any Claude or Codex session). Returns the new session id. Slow (a few seconds) — say a short spoken preamble first.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "prompt": {"type": "string"},
+                "cwd": {"type": "string"},
                 "agent": {
                     "type": "string",
                     "enum": ["aisdk", "codex-aisdk", "opencode"],
@@ -408,9 +550,8 @@ FLEET_TOOLS = [
                 "thinkingLevel": {
                     "type": "string",
                     "enum": ["low", "medium", "high", "xhigh"],
-                    "description": "Optional Codex reasoning effort for a Codex session.",
+                    "description": "Optional reasoning effort for a Claude or Codex session (ignored for OpenCode).",
                 },
-                "cwd": {"type": "string"},
             },
             "required": ["prompt"],
         },
@@ -448,13 +589,32 @@ FLEET_TOOLS = [
             "required": ["session_id"],
         },
     },
+    {
+        "name": "search_transcript",
+        "description": "Search the full transcript of ONE session for a word or phrase and get back the matching snippets (with who said it — user/assistant/tool/thinking — and how long ago). Use this to answer 'what did session X say about Y?', 'did it ever mention the database migration?', 'find where it decided to use ElevenLabs', etc. — the snapshot only shows the latest line, this searches the whole history. Resolve the session id first (via list_sessions or the snapshot).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string"},
+                "query": {
+                    "type": "string",
+                    "description": "Word or phrase to look for (case-insensitive substring).",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max snippets to return (default 8, max 50).",
+                },
+            },
+            "required": ["session_id", "query"],
+        },
+    },
 ]
 
 # The escalation tool — hands a hard/risky question to the single deep-think
 # advisor (a stronger Opus backend session with full repo + tool access).
 ESCALATE_TOOL = {
     "name": "consult_advisor",
-    "description": "Escalate a genuinely HARD or RISKY question to the deep-think advisor: a stronger model running as a real lfg session with full repo + tool access, so it can both reason carefully AND act on the fleet. Use only when careful reasoning is truly needed, not for simple disambiguation (just ask the user). Slow — say a short spoken preamble first. Returns a short spoken answer.",
+    "description": "Escalate a genuinely HARD or RISKY question to the deep-think advisor: a stronger model with full repo + tool access, so it can both reason carefully AND act on the fleet. Use only when careful reasoning is truly needed, not for simple disambiguation (just ask the user). The advisor runs in the BACKGROUND and answers asynchronously: this returns immediately, and the advisor's reply is spoken to the user automatically when it's ready. So just tell the user in one short sentence that you're checking with the advisor — do NOT wait for or invent its answer.",
     "input_schema": {
         "type": "object",
         "properties": {"question": {"type": "string"}},
@@ -521,6 +681,52 @@ async def set_tool(label: str) -> None:
         pass
 
 
+async def set_user_transcript(text: str, final: bool) -> None:
+    """Publish the speaking user's live transcript to the room so the call UI can
+    show it — the user sees their words being recognized in real time (and knows
+    the agent is hearing them). `final` marks a committed utterance vs an
+    in-progress partial. Merged in with the other lfg.* attributes (set_attributes
+    only touches the keys it's given)."""
+    if ROOM is None:
+        return
+    try:
+        await ROOM.local_participant.set_attributes(
+            {"lfg.user_text": text or "", "lfg.user_final": "1" if final else "0"}
+        )
+    except Exception:
+        pass
+
+
+# When streaming STT finalizes a turn (ElevenLabs Scribe's OWN server-side VAD
+# commits on silence — see ELEVENLABS_STT_COMMIT_STRATEGY in voice-providers.ts),
+# that committed transcript IS the end-of-turn signal. But livekit only ends a
+# turn off the LOCAL Silero VAD: on an STT FINAL it runs end-of-turn detection
+# only when `not self._speaking` (audio_recognition.py). Under box load/crowd
+# noise the local VAD stays stuck "speaking", so the final lands but the turn
+# never commits — speech transcribed, agent silent (the exact bug). So when our
+# STT delivers a real final, force the turn explicitly. Set
+# LFG_FORCE_TURN_ON_STT_FINAL=0 to fall back to pure local-VAD endpointing.
+_FORCE_TURN_ON_FINAL = bool(STT_WS_URL) and os.environ.get(
+    "LFG_FORCE_TURN_ON_STT_FINAL", "1"
+) != "0"
+
+
+def force_commit_turn() -> None:
+    """Force the AgentSession to end the user's turn and reply now, driven by the
+    STT's server-side-VAD commit rather than the local VAD. No-op if disabled or
+    the session isn't running (commit_user_turn raises then)."""
+    if not _FORCE_TURN_ON_FINAL:
+        return
+    sess = SESSION
+    if sess is None:
+        return
+    try:
+        sess.commit_user_turn()
+    except Exception:
+        # RuntimeError("AgentSession isn't running") between turns / on teardown.
+        pass
+
+
 # ── speaker scoping + focus (who is talking, and what project they're on) ─────
 def _refresh_current_user() -> None:
     """Read the speaking user from the human participant's `lfg.user` attribute
@@ -579,6 +785,35 @@ async def _lfg_post(path: str, payload: dict) -> dict:
         return j if r.status == 200 else {"error": f"http {r.status}", **j}
 
 
+def _agent_family(agent: str | None) -> str:
+    """Collapse the internal harness kind into a model family the voice agent
+    reasons about: 'opencode' vs 'codex' vs 'claude'. aisdk == Claude-via-SDK;
+    codex-aisdk == Codex-via-SDK. A missing/unknown value defaults to 'claude'."""
+    if agent in ("codex", "codex-aisdk"):
+        return "codex"
+    if agent == "opencode":
+        return "opencode"
+    return "claude"
+
+
+def _ago(ms: int | float | None) -> str | None:
+    """Compact 'how long ago' for an epoch-ms timestamp ('12s', '5m', '3h',
+    '2d'), or None when there's no timestamp. Used to give the brain a sense of
+    how stale / active each session is without dumping raw timestamps."""
+    if not ms:
+        return None
+    secs = max(0, int(time.time() - ms / 1000))
+    if secs < 60:
+        return f"{secs}s"
+    mins = secs // 60
+    if mins < 60:
+        return f"{mins}m"
+    hrs = mins // 60
+    if hrs < 24:
+        return f"{hrs}h"
+    return f"{hrs // 24}d"
+
+
 async def _scoped_sessions() -> list[dict]:
     """Live sessions visible to the speaking user: their own (by assignedUser)
     plus whatever they're focused on. With no CURRENT_USER, the whole fleet."""
@@ -610,15 +845,26 @@ async def run_tool(name: str, args: dict) -> str:
             focus = _read_focus()
             rows = []
             for s in await _scoped_sessions():
-                rows.append(
-                    {
-                        "id": s.get("sessionId"),
-                        "title": (s.get("title") or "")[:60],
-                        "user": s.get("assignedUser"),
-                        "last": (s.get("lastUserText") or "")[:60],
-                        "focused": s.get("sessionId") == focus,
-                    }
-                )
+                row = {
+                    "id": s.get("sessionId"),
+                    "title": (s.get("title") or "")[:60],
+                    "user": s.get("assignedUser"),
+                    # Raw harness kind (claude/codex/aisdk/codex-aisdk/opencode)
+                    # plus a collapsed family so the voice agent can tell
+                    # OpenCode apart from regular Claude/Codex sessions.
+                    "agent": s.get("agent"),
+                    "agentFamily": _agent_family(s.get("agent")),
+                    "model": s.get("model"),
+                    "project": s.get("project"),
+                    "status": s.get("status"),
+                    "idle": _ago(s.get("lastActivityAt")),
+                    "last": (s.get("lastUserText") or "")[:60],
+                    "focused": s.get("sessionId") == focus,
+                }
+                # Only surface a reason when actually blocked, to keep rows lean.
+                if s.get("status") == "blocked":
+                    row["blockedReason"] = s.get("statusDetail") or s.get("statusReason")
+                rows.append(row)
             return json.dumps(rows)
         if name == "list_repos":
             j = await _lfg_get("/api/repos")
@@ -649,10 +895,17 @@ async def run_tool(name: str, args: dict) -> str:
             agent = (args.get("agent") or "").strip()
             if agent in ("aisdk", "codex-aisdk", "opencode"):
                 payload["agent"] = agent
+            # Thinking level applies to any reasoning-capable agent (Claude +
+            # Codex, CLI or ai-sdk). The server default agent is Claude (aisdk),
+            # which honors it, so don't force Codex just because a level was set —
+            # only skip it for opencode, whose provider has no reasoning knob (the
+            # server would 400 the request otherwise).
             thinking_level = (args.get("thinkingLevel") or "").strip()
-            if thinking_level in ("low", "medium", "high", "xhigh"):
+            if (
+                thinking_level in ("low", "medium", "high", "xhigh")
+                and payload.get("agent", "aisdk") != "opencode"
+            ):
                 payload["thinkingLevel"] = thinking_level
-                payload.setdefault("agent", "codex-aisdk")
             if CURRENT_USER:
                 payload["user"] = CURRENT_USER
             await set_activity("replying")
@@ -664,6 +917,50 @@ async def run_tool(name: str, args: dict) -> str:
                 sid = j.get("sessionId") or j.get("tmuxName") or ""
                 return f"created session {sid}"
             return j.get("error") or "create failed"
+        if name == "search_transcript":
+            # Read-only, but still scope to the speaking user's visible sessions
+            # so voice can't read another person's transcript.
+            sid = (args.get("session_id") or "").strip()
+            visible = {s.get("sessionId") for s in await _scoped_sessions()}
+            if not sid or sid not in visible:
+                return (
+                    "couldn't find that session for you — call list_sessions to "
+                    "resolve the exact id first, then try again"
+                )
+            query = (args.get("query") or "").strip()
+            if not query:
+                return "need a word or phrase to search for"
+            payload = {"query": query}
+            try:
+                limit = int(args.get("limit") or 8)
+                if limit > 0:
+                    payload["limit"] = limit
+            except (TypeError, ValueError):
+                pass
+            j = await _lfg_post(f"/api/sessions/{sid}/transcript/search", payload)
+            if j.get("error"):
+                return j.get("error") or "search failed"
+            results = j.get("results") or []
+            if not results:
+                return f"no matches for \"{query}\" in that session's transcript"
+            hits = [
+                {
+                    "who": r.get("role"),
+                    "kind": r.get("kind"),
+                    "ago": _ago(r.get("ts")),
+                    "text": r.get("snippet"),
+                }
+                for r in results
+            ]
+            return json.dumps(
+                {
+                    "query": query,
+                    "total": j.get("total", len(hits)),
+                    "showing": len(hits),
+                    "truncated": j.get("truncated", False),
+                    "matches": hits,
+                }
+            )
         if name in ("reply_to_session", "answer_session_prompt", "close_session"):
             # Resolve-before-act: never act on a guessed/blank id, and never reach
             # outside the speaking user's scope. Force the model to list first.
@@ -698,6 +995,17 @@ async def run_tool(name: str, args: dict) -> str:
     return f"unknown tool {name}"
 
 
+def _as_system(system):
+    """Wrap a plain system string into a single cache-controlled block so the
+    large, stable instruction prefix is prompt-cached across turns (and across
+    connects, since SYSTEM_PROMPT is frozen). A pre-built block list passes
+    through untouched. Cache reads cost ~0.1x — a big win on a chatty voice
+    loop that re-sends the same multi-KB system prompt every single turn."""
+    if isinstance(system, str):
+        return [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]
+    return system
+
+
 async def anthropic_call(
     messages: list[dict],
     system: str,
@@ -713,7 +1021,7 @@ async def anthropic_call(
     body = {
         "model": model,
         "max_tokens": max_tokens,
-        "system": system,
+        "system": _as_system(system),
         "messages": messages,
     }
     if tools:
@@ -761,7 +1069,7 @@ async def anthropic_stream(
     body = {
         "model": model,
         "max_tokens": max_tokens,
-        "system": system,
+        "system": _as_system(system),
         "messages": messages,
         "stream": True,
     }
@@ -843,51 +1151,153 @@ async def anthropic_stream(
     return ordered, stop_reason
 
 
-# ── the advisor: ONE in-process Opus hop ─────────────────────────────────────
+# ── the advisor: ONE Opus hop, run in the BACKGROUND ─────────────────────────
 # The voice brain (Haiku) handles everything live. When a question is genuinely
 # hard or risky, it consults Opus ONCE — same fleet tools, so the advisor can
 # both reason and act. The advisor does NOT get consult_advisor itself, so there
 # is no recursive escalation and exactly one, fast, legible advisor.
-async def consult_advisor(question: str) -> str:
-    """Run one Opus pass over a hard/risky question and return its spoken answer.
+#
+# The Opus pass is SLOW (a full reasoning pass, sometimes tens of seconds). It
+# used to run INLINE in the live turn, stalling the conversation into dead air.
+# Now it runs as a BACKGROUND task: the brain's tool call returns immediately with
+# a holding result (so the turn ends fast with a one-line "I'm on it"), and when
+# Opus finishes its answer is spoken out-of-band via session.say(). Single-flight:
+# a second consult requested while one is in flight is told it's still working.
+async def _advisor_pass(question: str) -> str:
+    """One Opus pass over a hard/risky question; returns its spoken answer.
     Opus shares the fleet tools (it can act) but cannot escalate further."""
     q = (question or "").strip() or "Please advise."
-    print(f"[voice] consult advisor: {q[:80]}", flush=True)
+    for model in ADVISOR_MODELS:
+        # Fresh msgs each attempt — run_brain mutates it with the tool loop.
+        answer = await run_brain(
+            [{"role": "user", "content": q}],
+            model=model,
+            system=SYSTEM_PROMPT + ADVISOR_NOTE,
+            tools=FLEET_TOOLS,  # no consult_advisor → no recursion
+            live_context=LIVE_CONTEXT,
+        )
+        if answer:
+            print(f"[voice] advisor ({model}) answered", flush=True)
+            return answer
+    return "The advisor came up empty on that one — try rephrasing the question."
+
+
+async def _run_advisor(question: str) -> None:
+    """Background runner: do the Opus pass, then speak the answer into the room.
+    Always clears the orb 'consulting' state and the in-flight task on the way out,
+    so a future consult can start even if this one errors."""
+    global _ADVISOR_TASK
+    q = (question or "").strip() or "Please advise."
+    print(f"[voice] consult advisor (bg): {q[:80]}", flush=True)
     await set_activity("consulting")
     try:
-        for model in ADVISOR_MODELS:
-            # Fresh msgs each attempt — run_brain mutates it with the tool loop.
-            answer = await run_brain(
-                [{"role": "user", "content": q}],
-                model=model,
-                system=SYSTEM_PROMPT + ADVISOR_NOTE,
-                tools=FLEET_TOOLS,  # no consult_advisor → no recursion
-            )
-            if answer:
-                print(f"[voice] advisor ({model}) answered", flush=True)
-                return answer
+        answer = await _advisor_pass(q)
+        # Splice the answer back in out-of-band. The live turn that requested the
+        # consult already ended with a short "I'll check"; this is the advisor
+        # reporting back a moment later. (If the user happens to be mid-turn,
+        # session.say serializes it after the current speech.)
+        if SESSION is not None and answer:
+            try:
+                await SESSION.say(f"About your question — {answer}")
+            except Exception as e:
+                print(f"[voice] advisor say failed: {e}", flush=True)
+        else:
+            print(f"[voice] advisor answer (no session to speak): {answer}", flush=True)
+    except Exception as e:
+        print(f"[voice] advisor bg failed: {e}", flush=True)
     finally:
         await set_activity("")
-    return "The advisor is busy right now — give me a moment and ask again."
+        _ADVISOR_TASK = None
 
 
-async def run_brain(msgs, *, model: str, system: str, emit=None, tools=None) -> str:
+async def dispatch_advisor(question: str) -> str:
+    """Tool entrypoint: kick off the advisor in the BACKGROUND and return a holding
+    result immediately so the live turn never stalls. Single-flight — a consult
+    requested while one is already running is told to wait."""
+    global _ADVISOR_TASK
+    if _ADVISOR_TASK is not None and not _ADVISOR_TASK.done():
+        return (
+            "The advisor is still working on the previous question. Tell the user "
+            "in one short sentence that it's still thinking and you'll have the "
+            "answer shortly; do NOT start another consult."
+        )
+    _ADVISOR_TASK = asyncio.create_task(_run_advisor(question))
+    return (
+        "Advisor consult started in the background. In ONE short sentence tell the "
+        "user you're checking with the advisor and will report back in a moment, "
+        "then stop. Do NOT wait for or invent the advisor's answer — it will be "
+        "spoken automatically when ready."
+    )
+
+
+async def run_brain(
+    msgs, *, model: str, system: str, emit=None, tools=None, live_context=None
+) -> str:
     """Tool-use loop at `model`. Speaks each text chunk via emit() when given
     (the live voice turn); always returns the final assistant text. `tools`
     defaults to the full brain set (fleet + consult_advisor); the advisor passes
-    FLEET_TOOLS so it can act but not escalate again."""
+    FLEET_TOOLS so it can act but not escalate again.
+
+    `live_context` (volatile fleet status) is injected as a leading turn rather
+    than baked into `system`, so the cached system+tools prefix survives a
+    context refresh untouched."""
+    # Transcript gate (defense in depth): never run the brain on a noise turn.
+    # Streaming STT already suppresses non-lexical finals upstream, but the batch
+    # STT path emits them verbatim and a hallucinated filler ("you", "thanks for
+    # watching") would otherwise trigger a spoken reply to no one. If the latest
+    # real user message has no lexical content, drop the turn silently.
+    last_user = next(
+        (
+            m
+            for m in reversed(msgs)
+            if m.get("role") == "user" and isinstance(m.get("content"), str)
+        ),
+        None,
+    )
+    if last_user is not None and not _is_meaningful(last_user["content"]):
+        print(f"[voice] brain: dropping noise turn {last_user['content']!r}", flush=True)
+        return ""
     if tools is None:
         tools = BRAIN_TOOLS
+    if live_context:
+        msgs = [
+            {
+                "role": "user",
+                "content": f"<live_context>\n{live_context}\n</live_context>",
+            },
+            {"role": "assistant", "content": "Understood — using that current fleet context."},
+            *msgs,
+        ]
     for _ in range(6):
         # Stream the turn: text deltas are spoken as they arrive (sentence 1
         # starts playing while sentence 2 is still being generated), and the
         # blocks + stop_reason come back assembled so the tool loop is unchanged.
-        spoke = {"any": False}
+        turn_t0 = time.time()
+        spoke = {"any": False, "buf": "", "first": False}
 
         def on_text(chunk: str) -> None:
             spoke["any"] = True
             if emit:
                 emit(chunk)
+            # Debug visibility into streaming (live turns only): time-to-first-
+            # token and each sentence as it streams out — this is exactly the
+            # sentence boundary the TTS StreamAdapter synthesizes on, so these
+            # lines evidence the LLM->TTS streaming overlap end to end.
+            if not emit:
+                return
+            if not spoke["first"]:
+                spoke["first"] = True
+                print(f"[voice] stream: first token +{time.time() - turn_t0:.2f}s", flush=True)
+            spoke["buf"] += chunk
+            while True:
+                m = re.search(r"[.!?](\s|$)", spoke["buf"])
+                if not m:
+                    break
+                cut = m.end()
+                sent = spoke["buf"][:cut].strip()
+                spoke["buf"] = spoke["buf"][cut:]
+                if sent:
+                    print(f"[voice] stream sentence +{time.time() - turn_t0:.2f}s: {sent}", flush=True)
 
         blocks, stop_reason = await anthropic_stream(
             msgs, system, model=model, tools=tools, max_tokens=600, on_text=on_text
@@ -922,7 +1332,7 @@ async def run_brain(msgs, *, model: str, system: str, emit=None, tools=None) -> 
                 await set_tool(TOOL_LABELS.get(name, name))
                 try:
                     if name == "consult_advisor":
-                        out = await consult_advisor(args.get("question", ""))
+                        out = await dispatch_advisor(args.get("question", ""))
                     else:
                         out = await run_tool(name, args)
                 finally:
@@ -978,7 +1388,13 @@ class LfgLLMStream(llm.LLMStream):
         # and always clear the orb's activity/tool detail on the way out.
         try:
             await asyncio.wait_for(
-                run_brain(msgs, model=HAIKU_MODEL, system=SYSTEM_PROMPT, emit=emit),
+                run_brain(
+                    msgs,
+                    model=HAIKU_MODEL,
+                    system=SYSTEM_PROMPT,
+                    emit=emit,
+                    live_context=LIVE_CONTEXT,
+                ),
                 timeout=90,
             )
         except asyncio.TimeoutError:
@@ -1013,17 +1429,33 @@ class LfgTTSStream(tts.ChunkedStream):
         )
         # Stream raw int16 PCM as the GPU produces each chunk -> the room starts
         # playing at ~first-chunk latency instead of after the full utterance.
+        # Debug: one synth per sentence (the StreamAdapter calls this per sentence),
+        # with time-to-first-audio — so the logs show the LLM->TTS streaming overlap.
+        text = (self._input_text or "").strip()
+        t0 = time.time()
+        print(f"[voice] tts synth: {text[:70]!r}", flush=True)
+        first = True
+        total = 0
         carry = b""
         async with http.post(
             f"{LFG}/api/voice/tts", json={"text": self._input_text}
         ) as r:
             async for chunk in r.content.iter_chunked(9600):
+                if first and chunk:
+                    first = False
+                    print(f"[voice] tts first audio +{time.time() - t0:.2f}s", flush=True)
                 buf = carry + chunk
                 n = len(buf) - (len(buf) % 2)  # keep 16-bit sample alignment
                 if n:
                     output_emitter.push(buf[:n])
+                    total += n
                 carry = buf[n:]
         output_emitter.flush()
+        print(
+            f"[voice] tts done +{time.time() - t0:.2f}s "
+            f"({total} B, ~{total / 2 / 24000:.1f}s audio)",
+            flush=True,
+        )
 
 
 class LfgTTS(tts.TTS):
@@ -1066,10 +1498,13 @@ async def make_briefing(snapshot: str) -> str:
         {
             "role": "user",
             "content": (
-                "Greet me in one short sentence, then brief me on the fleet in "
-                "at most one more sentence — lead with anything BLOCKED that "
-                "needs my decision, else say how many are working/idle. Plain "
-                "spoken words only.\n\nSNAPSHOT:\n" + (snapshot or "(no sessions)")
+                "Greet me in one short, warm sentence and ask how you can help. "
+                "Do NOT recite a fleet status or how many sessions are "
+                "working/idle — keep the count to yourself. The ONLY exception: "
+                "if something is BLOCKED and needs my decision right now, lead "
+                "with that one thing in a few words, then ask how you can help. "
+                "Plain spoken words only.\n\nSNAPSHOT:\n"
+                + (snapshot or "(no sessions)")
             ),
         }
     ]
@@ -1082,20 +1517,26 @@ async def make_briefing(snapshot: str) -> str:
         ).strip()
         if text:
             return text
-    return "Hey, I'm online. Tap to ask me anything about your sessions."
+    return "Hey, I'm here — how can I help?"
 
 
 # ── per-start seeding ───────────────────────────────────────────────────────
 async def seed_system_prompt() -> str:
-    """Refresh the global system prompt from a live, user-scoped fleet snapshot,
-    the user's standing context, and their focused session. Returns the raw
-    snapshot (for the briefing)."""
-    global SYSTEM_PROMPT
+    """Refresh LIVE_CONTEXT from a live, user-scoped fleet snapshot, the user's
+    standing context, and their focused session. Returns the raw snapshot (for
+    the briefing).
+
+    Note: this deliberately does NOT touch SYSTEM_PROMPT — that stays frozen at
+    VOICE_PROMPT so it prompt-caches. The volatile context built here is injected
+    into the message stream by run_brain instead, so a refresh (at connect, or on
+    a fleet-completion push) costs a small messages-tier cache miss rather than
+    re-processing the entire system prompt uncached every time."""
+    global LIVE_CONTEXT
     snapshot = ""
     try:
         snap = await _lfg_get(f"/api/voice/snapshot{_user_qs()}")
         snapshot = snap.get("snapshot", "")
-        parts = [VOICE_PROMPT]
+        parts: list[str] = []
         focus = _read_focus()
         if focus:
             parts.append(
@@ -1107,18 +1548,93 @@ async def seed_system_prompt() -> str:
             )
         if snapshot:
             parts.append(
-                "=== SESSION SNAPSHOT (point-in-time, captured when you "
-                "connected — treat as STALE; call get_fleet_status for current "
-                "status before answering status questions) ===\n"
+                "=== SESSION SNAPSHOT (refreshed live — updated at connect and "
+                "whenever a session finishes; still call get_fleet_status before "
+                "acting on a specific session to confirm its exact current "
+                "state) ===\n"
                 + snapshot
                 + "\n=== END SNAPSHOT ==="
             )
         if snap.get("context"):
             parts.append("=== USER CONTEXT ===\n" + snap["context"])
-        SYSTEM_PROMPT = "\n\n".join(parts)
+        LIVE_CONTEXT = "\n\n".join(parts)
     except Exception:
-        SYSTEM_PROMPT = VOICE_PROMPT
+        # Leave any prior LIVE_CONTEXT in place on a transient failure rather
+        # than blanking the assistant's situational awareness.
+        pass
     return snapshot
+
+
+# ── fleet completion PUSH: auto-fresh context + proactive heads-up ───────────
+async def _handle_completion(ev: dict) -> None:
+    """A session just finished a turn (pushed from lfg). Refresh LIVE_CONTEXT so
+    the next user turn is already current, and — debounced — speak a short
+    heads-up so the user hears about it hands-free without having to ask."""
+    global _LAST_PUSH_ANNOUNCE
+    # Always refresh: cheap, and it keeps the assistant's awareness live even if
+    # we choose not to announce this particular completion.
+    await seed_system_prompt()
+    title = (ev.get("title") or "a session").replace("\n", " ").strip()
+    if len(title) > 60:
+        title = title[:59].rstrip() + "…"
+    now = time.time()
+    if SESSION is None or now - _LAST_PUSH_ANNOUNCE < PUSH_ANNOUNCE_GAP:
+        return
+    _LAST_PUSH_ANNOUNCE = now
+    try:
+        # session.say serializes after any in-flight speech, so this never cuts
+        # the user off mid-turn — it lands in the next gap.
+        await SESSION.say(f"Heads up — {title} just finished.")
+    except Exception as e:
+        print(f"[voice] push announce failed: {e}", flush=True)
+
+
+async def watch_fleet_events() -> None:
+    """Hold an SSE connection to lfg's /api/voice/events and react to every
+    session-completion push. Scoped to the current speaker; reconnects (with
+    backoff) on drop, and re-scopes when the speaking user changes."""
+    backoff = 1.0
+    while True:
+        scoped = CURRENT_USER  # snapshot the scope this connection is bound to
+        try:
+            http = await get_http()
+            url = f"{LFG}/api/voice/events{_user_qs()}"
+            async with http.get(url) as resp:
+                if resp.status != 200:
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, 30)
+                    continue
+                backoff = 1.0
+                event: str | None = None
+                async for raw in resp.content:
+                    # If the speaker changed, drop this stream so the outer loop
+                    # reconnects scoped to the new user.
+                    if CURRENT_USER != scoped:
+                        break
+                    line = raw.decode("utf-8", "ignore").strip()
+                    if line.startswith("event:"):
+                        event = line[6:].strip()
+                    elif line.startswith("data:") and event == "completed":
+                        try:
+                            ev = json.loads(line[5:].strip())
+                        except Exception:
+                            continue
+                        await _handle_completion(ev)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"[voice] fleet watch error: {e}", flush=True)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 30)
+
+
+def start_fleet_watch() -> None:
+    """Launch the fleet-completion watcher once per worker process."""
+    global _FLEET_WATCH_STARTED
+    if _FLEET_WATCH_STARTED:
+        return
+    _FLEET_WATCH_STARTED = True
+    asyncio.create_task(watch_fleet_events())
 
 
 async def start_session(session: AgentSession, *, clear: bool) -> None:
@@ -1173,23 +1689,100 @@ def _load_turn_detection():
             return inference.TurnDetector()
         except Exception as e:
             print(f"[voice] hosted TurnDetector unavailable ({e})", flush=True)
+    # The local onnx EOU model needs a LiveKit *inference executor* in the worker.
+    # On this self-hosted box predict_end_of_turn fails every turn with
+    # "no inference executor", which makes endpointing erratic (turns get cut off
+    # mid-sentence -> the agent jumps to "thinking" on a fragment). So the local
+    # EOU model is OPT-IN (LFG_LOCAL_EOU=1) until that executor is sorted; the
+    # reliable default is plain VAD silence-based endpointing.
+    if os.environ.get("LFG_LOCAL_EOU") == "1":
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", DeprecationWarning)
+                from livekit.plugins.turn_detector.english import EnglishModel
+            print("[voice] turn-detection: local EnglishModel (on-box, opt-in)", flush=True)
+            return EnglishModel()
+        except Exception as e:
+            print(f"[voice] local EOU unavailable ({e})", flush=True)
+    print("[voice] turn-detection: VAD endpointing", flush=True)
+    return "vad"
+
+
+def _build_noise_cancellation():
+    """On-box input denoiser: DTLN (livekit-plugins-dtln), wired as a
+    RoomInputOptions FrameProcessor so it sits BEFORE VAD/STT — the VAD and the
+    ElevenLabs streaming STT both see cleaned audio.
+
+    Krisp BVC (LiveKit's built-in noise_cancellation.BVC) is LiveKit-Cloud-only —
+    it round-trips audio through LiveKit's hosted inference, which this
+    self-hosted box has no account on — so we use DTLN, a small on-box ONNX
+    speech-enhancement model that runs locally. DTLNNoiseSuppressor is an
+    rtc.FrameProcessor[rtc.AudioFrame]; it lazily resamples whatever input rate
+    the room delivers (24 kHz here) down to its 16 kHz model and back, so it slots
+    in regardless of RoomInputOptions.audio_sample_rate. Returns None on any
+    failure (plugin missing / model load error) so the worker still starts — just
+    without denoising — rather than crashing the voice pipeline."""
     try:
-        # Local model. Suppress the plugin's import-time DeprecationWarning — we
-        # are deliberately using the local path (the suggested replacement is the
-        # cloud detector above, which doesn't fit a self-hosted deployment).
+        from livekit.plugins import dtln
+        nc = dtln.noise_suppression()
+        print("[voice] noise cancellation: DTLN (on-box, pre-VAD/STT)", flush=True)
+        return nc
+    except Exception as e:
+        print(f"[voice] DTLN unavailable ({e}); no input denoising", flush=True)
+        return None
+
+
+def _build_vad():
+    """Silero VAD, tuned for the CROWD-BABBLE case on DTLN-cleaned input.
+
+    The user's main symptom is ambient + crowd babble (diffuse, many overlapping
+    voices — NOT one distinct background speaker) FALSELY triggering a turn. The
+    first line of defence is to keep that babble from crossing the VAD at all, so
+    it never even reaches STT.
+
+    DTLN (see _build_noise_cancellation) plus the browser noise-canceller strip
+    most steady noise before the VAD, which both cleans real speech AND pushes
+    diffuse babble down to a low, smeared speech-probability. That headroom lets
+    us hold the activation bar HIGH without hurting genuine close-mic speech
+    (which stays high-probability after denoising):
+      - activation_threshold = 0.6      : a frame needs a clearly speech-like
+        probability to START a turn. Diffuse crowd babble — even when the denoiser
+        leaves a little — sits below this, so it doesn't open a turn; a real user
+        talking into the mic crosses it easily.
+      - deactivation_threshold = 0.35   : keep the wide hysteresis band (0.6 to
+        start, 0.35 to stop) so once a real turn is open, brief dips don't chatter
+        it on/off — and babble riding near the bar can't toggle speech.
+      - min_speech_duration = 0.08      : a short floor so a transient babble peak
+        or click can't open a turn, while still catching quick real onsets.
+    Whatever still slips through the VAD is caught downstream by the transcript
+    gate (_is_meaningful), which drops ASR hallucinations like "thanks for
+    watching" before they reach the brain. VAD here = don't even listen to babble;
+    gate = don't act on babble that got transcribed anyway.
+    NB: we use the (deprecated-in-2.0 but proven-LOCAL) silero loader on purpose —
+    it loads the on-box ONNX model directly. The inference.* path routes through a
+    LiveKit inference executor this self-hosted box doesn't have (the same reason
+    the local EOU turn-detector is disabled above). Returns None on any failure so
+    the caller omits vad= and AgentSession falls back to its bundled default —
+    never vad=None, which would disable VAD entirely."""
+    try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", DeprecationWarning)
-            from livekit.plugins.turn_detector.english import EnglishModel
-        print("[voice] turn-detection: local EnglishModel (on-box)", flush=True)
-        return EnglishModel()
+            from livekit.plugins import silero
+        vad = silero.VAD.load(
+            activation_threshold=0.6,
+            deactivation_threshold=0.35,
+            min_speech_duration=0.08,
+        )
+        print("[voice] VAD: silero, crowd-tuned (act=0.6/deact=0.35/min=0.08)", flush=True)
+        return vad
     except Exception as e:
-        print(f"[voice] turn-detector unavailable ({e}); plain VAD endpointing", flush=True)
-        return "vad"
+        print(f"[voice] tuned VAD unavailable ({e}); bundled default", flush=True)
+        return None
 
 
 # ── worker entrypoint ───────────────────────────────────────────────────────
 async def entrypoint(ctx: JobContext) -> None:
-    global ROOM
+    global ROOM, SESSION
     await ctx.connect()
     ROOM = ctx.room
 
@@ -1202,12 +1795,54 @@ async def entrypoint(ctx: JobContext) -> None:
     # turn_handling is the current API (replaces the deprecated vad=/turn_detection=
     # kwargs); we pass turn_detection explicitly because the default is the hosted
     # cloud detector. VAD is AgentSession's bundled Silero default — no vad= needed.
-    session = AgentSession(
+    #
+    # Barge-in / endpointing tuning (the fix for "the agent gets cut off
+    # mid-sentence"). With plain-VAD turn detection the library defaults are very
+    # trigger-happy — interruption.min_duration=0.5s, min_words=0, endpointing
+    # min_delay=0.5s — so a cough, a breath, a back-channel "mm-hm", or TTS echo
+    # bleeding into the mic interrupts the agent or ends the user's turn on a
+    # fragment. We keep barge-in ENABLED (so the user can always cut in) but raise
+    # the bar a little:
+    #   - interruption.enabled=True            → barge-in stays on (the non-deprecated
+    #                                             spelling of allow_interruptions=True)
+    #   - interruption.min_duration=0.6        → ~0.6s of speech before it counts as
+    #                                             a real interruption (was 0.5)
+    #   - endpointing.min_delay=0.6            → a bit more silence before the user's
+    #                                             turn ends, so a brief mid-sentence
+    #                                             pause doesn't ship a fragment (was 0.5)
+    # min_words further filters non-speech blips, but it gates on the LIVE transcript
+    # (agent_activity: skip interruption while current_transcript has < min_words).
+    # That only has a transcript to read when streaming STT is feeding interim
+    # results; with batch STT there's no mid-speech transcript, so a >0 value would
+    # suppress voice barge-in entirely. So only enable it when STT_WS_URL is set.
+    # These are partial dicts — TurnHandlingOptions/Endpointing/Interruption are
+    # TypedDicts and the library merges missing keys over its defaults.
+    interruption: dict = {"enabled": True, "min_duration": 0.6}
+    if STT_WS_URL:
+        interruption["min_words"] = 1
+    # A noise-tuned Silero VAD (see _build_vad) so background noise doesn't trip
+    # speech detection. Pass vad= only when it loaded — None would DISABLE VAD,
+    # so on failure we omit the kwarg and AgentSession uses its bundled default.
+    session_kwargs = dict(
         stt=make_stt(),
         llm=LfgLLM(),
         tts=build_tts(),
-        turn_handling=TurnHandlingOptions(turn_detection=_load_turn_detection()),
+        turn_handling=TurnHandlingOptions(
+            turn_detection=_load_turn_detection(),
+            endpointing={"min_delay": 0.6},
+            interruption=interruption,
+        ),
     )
+    _vad = _build_vad()
+    if _vad is not None:
+        session_kwargs["vad"] = _vad
+    session = AgentSession(**session_kwargs)
+    # Expose the session so the background advisor can speak its answer out-of-band.
+    SESSION = session
+
+    # Push, not poll: hold an SSE stream to lfg and react the instant another
+    # session finishes — refresh live context + (debounced) speak a heads-up.
+    start_fleet_watch()
 
     # A fresh tap of the orb shows up here as a participant (re)joining the
     # persistent "voice" room. Clear the prior conversation and re-brief so each
@@ -1223,7 +1858,14 @@ async def entrypoint(ctx: JobContext) -> None:
     def _on_attrs(_changed, _p) -> None:
         _refresh_current_user()
 
-    await session.start(Agent(instructions="lfg voice assistant."), room=ctx.room)
+    # On-box DTLN denoiser as an input FrameProcessor (before VAD/STT). Build the
+    # start kwargs conditionally so a missing/broken plugin just omits denoising
+    # rather than failing session.start — the worker must always come up.
+    start_kwargs: dict = {"room": ctx.room}
+    _nc = _build_noise_cancellation()
+    if _nc is not None:
+        start_kwargs["room_input_options"] = RoomInputOptions(noise_cancellation=_nc)
+    await session.start(Agent(instructions="lfg voice assistant."), **start_kwargs)
 
     # Every start clears prior context. A normal reconnect dispatches a fresh job
     # (this entrypoint) with an already-empty session, so the clear is a no-op

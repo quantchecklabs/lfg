@@ -32,7 +32,13 @@ image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("ffmpeg", "git")
     .pip_install(
-        "chatterbox-tts",            # Resemble AI Chatterbox (English)
+        # Chatterbox with real-time streaming (generate_stream). davidbrowne17's
+        # fork of resemble-ai/chatterbox: same `chatterbox` import + same voice,
+        # but adds chunked generation so /tts can stream audio as it's produced
+        # (~0.5s to first chunk) instead of returning the whole clip. The /tts
+        # handler falls back to the blocking generate() if generate_stream is
+        # somehow absent, so this can't regress to broken — only to non-streaming.
+        "git+https://github.com/davidbrowne17/chatterbox-streaming.git",
         "faster-whisper",            # fast CTranslate2 Whisper
         "soundfile",
         "numpy<2",
@@ -124,36 +130,76 @@ class Voice:
         @api.post("/tts")
         async def tts(req: Request, authorization: str | None = Header(default=None)):
             auth(authorization)
-            import numpy as np
+            import torch
             import torchaudio.functional as AF
+            from fastapi.responses import StreamingResponse
 
             body = await req.json()
             text = (body.get("text") or "").strip()
             if not text:
                 raise HTTPException(status_code=400, detail="expected {text}")
-            t0 = time.time()
-            wav = self.tts.generate(text).squeeze(0)  # [n] @ self.tts.sr
-            if int(self.tts.sr) != 24000:
-                wav = AF.resample(wav, int(self.tts.sr), 24000)
-            arr = wav.clamp(-1, 1).cpu().numpy()
-            dur = time.time() - t0
+            want_wav = bool(req.query_params.get("wav"))
+            sr = int(self.tts.sr)
+
             # The lfg worker (LfgTTS) wants RAW 24 kHz mono int16 PCM — no WAV
             # header — because it pushes the bytes straight into an output_emitter
-            # initialized at sample_rate=24000, mime audio/pcm. A WAV header (or a
-            # non-24k rate) plays as a click + wrong-pitch audio. `?wav=1` returns
-            # a WAV instead, for easy curl/browser testing.
-            if req.query_params.get("wav"):
-                buf = io.BytesIO()
-                sf.write(buf, arr, 24000, format="WAV")
-                payload, mime = buf.getvalue(), "audio/wav"
-            else:
-                payload = (arr * 32767.0).astype("<i2").tobytes()
-                mime = "audio/pcm"
-            print(f"[tts] {len(text)} chars -> {len(payload)}B {mime} in {dur:.2f}s", flush=True)
-            return Response(
-                content=payload,
-                media_type=mime,
-                headers={"X-Synth-Seconds": f"{dur:.3f}", "Cache-Control": "no-store"},
+            # at sample_rate=24000, mime audio/pcm (a WAV header or non-24k rate
+            # plays as a click + wrong pitch). `?wav=1` returns a WAV for curl.
+            def to_pcm(wav) -> bytes:
+                if not torch.is_tensor(wav):
+                    wav = torch.as_tensor(wav)
+                w = wav.squeeze()
+                if w.dim() == 0:
+                    return b""
+                if sr != 24000:
+                    w = AF.resample(w, sr, 24000)
+                arr = w.clamp(-1, 1).cpu().numpy()
+                return (arr * 32767.0).astype("<i2").tobytes()
+
+            stream_fn = getattr(self.tts, "generate_stream", None)
+
+            # Non-streaming: ?wav=1 test path, or if the build lacks generate_stream.
+            if want_wav or stream_fn is None:
+                t0 = time.time()
+                wav = self.tts.generate(text).squeeze(0)
+                if sr != 24000:
+                    wav = AF.resample(wav, sr, 24000)
+                arr = wav.clamp(-1, 1).cpu().numpy()
+                dur = time.time() - t0
+                if want_wav:
+                    buf = io.BytesIO()
+                    sf.write(buf, arr, 24000, format="WAV")
+                    payload, mime = buf.getvalue(), "audio/wav"
+                else:
+                    payload = (arr * 32767.0).astype("<i2").tobytes()
+                    mime = "audio/pcm"
+                print(f"[tts] whole {len(text)}ch -> {len(payload)}B {mime} in {dur:.2f}s", flush=True)
+                return Response(
+                    content=payload,
+                    media_type=mime,
+                    headers={"X-Synth-Seconds": f"{dur:.3f}", "Cache-Control": "no-store"},
+                )
+
+            # Streaming: yield 24 kHz mono int16 PCM as Chatterbox produces chunks.
+            # generate_stream yields either a tensor or an (audio, metrics) tuple.
+            def gen():
+                t0 = time.time()
+                first = True
+                total = 0
+                for chunk in stream_fn(text):
+                    audio = chunk[0] if isinstance(chunk, (tuple, list)) else chunk
+                    pcm = to_pcm(audio)
+                    if not pcm:
+                        continue
+                    if first:
+                        print(f"[tts] stream first chunk +{time.time()-t0:.2f}s", flush=True)
+                        first = False
+                    total += len(pcm)
+                    yield pcm
+                print(f"[tts] stream done +{time.time()-t0:.2f}s ({total}B, {len(text)}ch)", flush=True)
+
+            return StreamingResponse(
+                gen(), media_type="audio/pcm", headers={"Cache-Control": "no-store"}
             )
 
         @api.post("/stt")
