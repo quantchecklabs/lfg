@@ -26,9 +26,39 @@ declare global {
       jsxRuntime: typeof JsxRuntime;
       registerExtension: typeof registerExtension;
     };
+    __connectioToken?: string;
   }
 }
 window.lfg = { React, ReactDOM, jsxRuntime: JsxRuntime, registerExtension };
+
+// Connectio integration seam: when embedded as an iframe from the Connectio
+// PWA, the host page passes a Cognito ID token via `?token=` on this app's
+// *initial* navigation — the one request a browser can't attach a custom
+// header or WebSocket subprotocol to. The reverse proxy in front of this app
+// accepts that query-string token for the page load; every request this app
+// makes on its own from here on uses a normal Authorization header (patched
+// into fetch below) or, for the terminal socket, a WebSocket subprotocol (see
+// TermView.tsx) — both of which the proxy also accepts. Standalone/
+// self-hosted use (no `?token=`) is unaffected: this whole block no-ops.
+{
+  const params = new URLSearchParams(window.location.search);
+  const token = params.get("token");
+  if (token) {
+    window.__connectioToken = token;
+    // Don't leave the token sitting in the URL/browser history any longer
+    // than the one request that needed it there.
+    params.delete("token");
+    const rest = params.toString();
+    window.history.replaceState(null, "", window.location.pathname + (rest ? `?${rest}` : ""));
+
+    const nativeFetch = window.fetch.bind(window);
+    window.fetch = (input, init) => {
+      const headers = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
+      if (!headers.has("Authorization")) headers.set("Authorization", `Bearer ${token}`);
+      return nativeFetch(input, { ...init, headers });
+    };
+  }
+}
 
 // Mirror the OS light/dark preference onto the `.dark` class the shadcn
 // components key off (see @custom-variant dark in index.css). This is the

@@ -46,7 +46,10 @@ const KEYS = {
   enter: "\r",
 };
 
-const TERM_SESSION = "main";
+// A Connectio embed picks the session via `?session=` on the iframe's initial
+// URL (see main.tsx for the matching `?token=` handling); standalone use
+// falls back to "main" like before.
+const TERM_SESSION = new URLSearchParams(window.location.search).get("session") || "main";
 type TerminalInstance = InstanceType<typeof GhosttyTerminal>;
 type GhosttyWithInput = TerminalInstance & {
   element?: HTMLElement;
@@ -379,7 +382,12 @@ export function TermView() {
       const url = `${proto}//${location.host}/api/term?session=${encodeURIComponent(
         TERM_SESSION,
       )}&cols=${term.cols}&rows=${term.rows}`;
-      const ws = new WebSocket(url);
+      // Browsers can't set custom headers on a WebSocket handshake, so a
+      // Connectio embed's token (captured in main.tsx) travels as a
+      // subprotocol instead — the reverse proxy in front of this app reads it
+      // from there. Standalone use has no token and opens a plain socket.
+      const token = window.__connectioToken;
+      const ws = token ? new WebSocket(url, [token]) : new WebSocket(url);
       ws.binaryType = "arraybuffer";
       wsRef.current = ws;
 
