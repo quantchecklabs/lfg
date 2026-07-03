@@ -52,11 +52,13 @@ window.lfg = { React, ReactDOM, jsxRuntime: JsxRuntime, registerExtension };
     window.history.replaceState(null, "", window.location.pathname + (rest ? `?${rest}` : ""));
 
     const nativeFetch = window.fetch.bind(window);
-    window.fetch = (input, init) => {
+    const patchedFetch: typeof fetch = (input, init) => {
       const headers = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
       if (!headers.has("Authorization")) headers.set("Authorization", `Bearer ${token}`);
       return nativeFetch(input, { ...init, headers });
     };
+    patchedFetch.preconnect = nativeFetch.preconnect;
+    window.fetch = patchedFetch;
   }
 }
 
